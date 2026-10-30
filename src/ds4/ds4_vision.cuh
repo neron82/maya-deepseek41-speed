@@ -28,7 +28,8 @@ struct VisionGeo {
 
 class VisionTower {
 public:
-    /// read(name, shape, dst): the tensor's shape, and (dst not null) its BF16 data into dst; false: not there
+    /// read(name, shape, dst): the tensor's shape, and (dst not null) its data as BF16 into dst (the model's reader
+    /// converts a pack that stores the tower in F16 or F32, nearest even; BF16 packs are read as they are); false: not there
     using Reader = std::function<bool(const std::string& name, std::vector<int64_t>& shape, void* dst)>;
     VisionTower() = default;
     VisionTower(const VisionTower&) = delete;

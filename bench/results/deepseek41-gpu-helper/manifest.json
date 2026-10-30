@@ -1,0 +1,76 @@
+{
+  "dataset": "DeepSeek-V4.1-Flash IQ2_XXS on two RTX 3090s with a GPU 0 expert helper",
+  "repository": {
+    "upstream": "mw00/project-maya",
+    "upstream_commit": "249f9a8",
+    "branch": "deepseek-v4.1-gpu-helper"
+  },
+  "measured_utc": "2026-10-29",
+  "model": "DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-IQ2_XXS (IQ2_XXS, 2.00 bpw)",
+  "engine": {
+    "name": "maya-ds4",
+    "sha256": "d9e133a6c473f8b06cb35b150b843c8a4dc8c5f60630716faebc2baff6b2db34",
+    "recorded_sha256_2026_10_29": "88433596c7d236d0d066e4c0fbb50e123900a2945b6696eb0b9886abb25d0e4c",
+    "plan_sha256": "cbf209b46e4558de311637c4cb5e92b2e7357f36b102fc522ad07c999673ba53"
+  },
+  "hardware": {
+    "cpu": "AMD Ryzen 7 3700X, 8 cores / 16 threads",
+    "ram_gib": 128,
+    "gpus": "2x NVIDIA RTX 3090 24 GB",
+    "roles": "physical GPU 1 (fast, PCIe 4 x16): layers and native vision; physical GPU 0 (slower PCIe): 24 GB expert helper",
+    "software": "Linux, CUDA"
+  },
+  "files": [
+    "README.md - method, result and limits",
+    "results.json - sanitized cold/repeat scalars, controls and source hashes",
+    "helper-config.json - portable env + CLI preset with placeholders"
+  ],
+  "source_artifacts": [
+    {
+      "artifact": "maya-fork-current-helper24-20261030/results.json",
+      "sha256": "c4b4b0ad09f8d9077d4d2d863dddbc36a68d043ba1bdcda5b1d70299a8c3ef21",
+      "used_in": "results.json runs (fresh build of this branch)"
+    },
+    {
+      "artifact": "maya-fork-current-helper24-20261030/meta.json",
+      "sha256": "1b8da51a54bece8f16c19cfeae673ddbfc589e76928ece1b9b3d405f9aaa07dd",
+      "used_in": "reproduction identity, ready time and engine SHA-256"
+    },
+    {
+      "artifact": "project-maya/.omp-deepseek/runs/maya-serving-helper24-fused-final/results.json",
+      "sha256": "e09ce4c8945e3aa549ab2c38d4661c35a201865afdc1c8621bd5d7511c75b18d",
+      "used_in": "recorded 2026-10-29 runs"
+    },
+    {
+      "artifact": "project-maya/.omp-deepseek/runs/maya-serving-helper24-fused-final/meta.json",
+      "sha256": "1818a3e34e12d1be2e3202755396e4c28459e6c9bca48d9855996dfe3686ec34",
+      "used_in": "hardware, engine, argv and env"
+    },
+    {
+      "artifact": "project-maya/.omp-deepseek/plans/maya-helper24-fused-final.json",
+      "sha256": "cbf209b46e4558de311637c4cb5e92b2e7357f36b102fc522ad07c999673ba53",
+      "used_in": "exact helper preset"
+    },
+    {
+      "artifact": "project-maya/.omp-deepseek/experiment-summary.json",
+      "sha256": "dd7733ef33e6f96819cd36ca083e0d6b486816394382e980f89bd3b55580ec2b",
+      "used_in": "single-GPU Maya control"
+    },
+    {
+      "artifact": "strata-fork-current-20261030/results.json",
+      "sha256": "d8ee69997e50656ce4b8017631025a28a2358690c67f23e1545fa6234d23b905",
+      "used_in": "external Strata single-GPU control"
+    },
+    {
+      "artifact": "strata-fork-current-20261030/meta.json",
+      "sha256": "e97d07faa2db483564a65ab07558975a763f8ce7d3493a524fc76f6df39591c5",
+      "used_in": "external Strata control identity"
+    }
+  ],
+  "sanitisation": [
+    "Published values are throughput, timing, allocation, configuration and comparison scalars only.",
+    "Token arrays, prompt ids, generated text, request and response bodies, monitor streams, engine logs, GPU UUIDs and absolute local paths are not published.",
+    "GPU roles are described by physical index and link speed instead of UUID.",
+    "The config uses documented placeholders for every local path; it contains no machine-specific default."
+  ]
+}

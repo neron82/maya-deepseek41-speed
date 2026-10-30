@@ -895,6 +895,12 @@ class StrataEngine:
             sn = tune.get("spec_n_min")   # ... drafts it keeps whatever their confidence
             if isinstance(sn, int) and not isinstance(sn, bool) and 0 <= sn <= 15:
                 tune_keys += f" spec_n_min={sn}"
+        # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a start
+        # other requests share (a system prompt and its tools) - the engine pins the checkpoint there.  Absent or
+        # unresolved: none, the line is the one it was.
+        prefix = sampling.get("strata_prefix")
+        pn = prefix.get("tokens") if isinstance(prefix, dict) else None
+        pin_key = f" pin={pn}" if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0 else ""
         bias = sampling.get("logit_bias")      # {id: bias}, checked by the handler (logit_bias_of)
         bias_key = (" logit_bias=" + ",".join(f"{int(i)}:{float(b):g}" for i, b in sorted(bias.items()))
                     if isinstance(bias, dict) and bias else "")
@@ -903,8 +909,8 @@ class StrataEngine:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic) - but
             # the penalties do: they change the logits greedy picks from (#273: a greedy answer's loops)
-            return (" temperature=0" + penalty_keys + think + tune_keys + StrataEngine.projection_key(sampling) +
-                    bias_key)
+            return (" temperature=0" + penalty_keys + think + tune_keys + pin_key +
+                    StrataEngine.projection_key(sampling) + bias_key)
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -921,7 +927,7 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        keys += think + tune_keys
+        keys += think + tune_keys + pin_key
         return keys + StrataEngine.projection_key(sampling) + bias_key
 
     @staticmethod
@@ -1802,21 +1808,32 @@ class Service:
         if "logit_bias" in req:
             req["logit_bias"] = bias
 
-    def render_ids(self, messages, tools, kwargs, suffix="") -> list[int]:
-        """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt) and
-        tokenized.  A special token's text inside a message or a tool is encoded as that text; only the literals the
-        template (or the suffix) writes are special tokens."""
+    def render_text(self, messages, tools, kwargs, suffix="", **render_kwargs) -> tuple[str, bool]:
+        """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt), with
+        the literals inside a message left marked (`render_ids` unmarks and tokenizes it; a shared start's head ends
+        before PREFIX_END).  `changed` says whether anything was marked."""
         marked, marked_tools, changed = mark_literals(messages, tools, self.literals)
-        prompt = self.template.render(marked, tools=marked_tools, **kwargs)
+        prompt = self.template.render(marked, tools=marked_tools, **kwargs, **render_kwargs)
         if kwargs.get("enable_thinking") is False and prompt.endswith("<think>"):
             # GLM-5.3's template opens the thinking block whatever it is told (no enable_thinking, and an effort it
             # does not know means 'max'): with thinking off the answer was written inside an open <think>.  Close
             # it empty, the form the same template writes for a past turn that did not think.
             prompt += "</think>"
+        return prompt + suffix, changed
+
+    def encode_text(self, prompt: str, changed: bool) -> list[int]:
+        """`prompt` tokenized: a special token's text inside a message or a tool stays that text (`changed`).  Only the
+        literals the template writes are special tokens."""
         if not changed:
-            return self.tok.encode(prompt + suffix, parse_special=True)
+            return self.tok.encode(prompt, parse_special=True)
         prompt, plain = unmark_literals(prompt, self.literals)
-        return self.tok.encode(prompt + suffix, parse_special=True, plain=plain)
+        return self.tok.encode(prompt, parse_special=True, plain=plain)
+
+    def render_ids(self, messages, tools, kwargs, suffix="") -> list[int]:
+        """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt) and
+        tokenized.  A special token's text inside a message or a tool is encoded as that text; only the literals the
+        template (or the suffix) writes are special tokens."""
+        return self.encode_text(*self.render_text(messages, tools, kwargs, suffix))
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -2504,10 +2521,13 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
-        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
+        starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run().
+        `req` (the client's request or the Responses API's normalized form): DeepSeek auto-pins its system prompt and
+        tools (a start its sub-agents share), and a "strata_prefix" there resolves to {"tokens": N} (see
+        resolve_prefix); anything else leaves the request as it came."""
         given, force = kwargs, kwargs.get("_force_tool")
         kwargs = {k: v for k, v in kwargs.items() if k != "_force_tool"}
         if force is not None and tools:
@@ -2633,7 +2653,100 @@ class Service:
                                       f"({len(ids)} tokens) + max tokens ({max_new}) exceeds the context; requests "
                                       "are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+        # the start an agent and its sub-agents share (its system prompt and tools): pinned on the server unless the
+        # client says where its own shared prefix ends; a request with pictures is left as it came (the engine's
+        # picture spans are its own, and a pin is a plain token count)
+        if (getattr(self.template, "deepseek", False) and req is not None and
+                req.get("strata_prefix") is None and not images):
+            lead = self.deepseek_shared_start(messages)
+            if lead:
+                req["strata_prefix"] = {"messages": lead}
+        if req is not None and req.get("strata_prefix") is not None:
+            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
+
+    @staticmethod
+    def deepseek_shared_start(messages) -> int:
+        """DeepSeek-V4.1 only: how many leading messages are the system prompt (its tools are rendered with them).  An
+        agent and its sub-agents that work behind the same system prompt and tools share exactly this start, so the
+        engine keeps a checkpoint of its state there (pin=N): the next agent behind the same start goes back to it
+        instead of reading it again.  0: none (MAYA_DS4_AUTO_PIN=0, no system message, or nothing after it)."""
+        if os.environ.get("STRATA_DS4_AUTO_PIN", "1") == "0":
+            return 0
+        n = 0
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+                n += 1
+            else:
+                break
+        return n if 0 < n < len(messages) else 0
+
+    def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False) -> dict:
+        """R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix: a long document that many
+        short questions follow.  Three ways to say where it ends: `{"messages": K}` (the first K messages), `{"message":
+        I, "chars": N}` (the first N characters of message I's text: a document and its question in one message) or
+        `{"tokens": N}`.  The engine reads the prompt in two parts there, keeps the checkpoint at the boundary pinned
+        (a fourth checkpoint, read by the slot machinery like the rest) so N questions cost one prefix.  Returns
+        {"tokens": N} (what the engine's `pin=N` takes: always a prefix of the prompt's ids, the tokenizer's merge across
+        the boundary included), or {} when the prefix cannot be marked (said in the log: the request is never refused
+        for it). False opts out of marking a shared prefix; a malformed field is a 400."""
+        if spec is False:
+            return {}
+        keys = ("messages", "message", "chars", "tokens")
+        if (not isinstance(spec, dict) or not spec or any(k not in keys for k in spec) or
+                set(spec) not in ({"messages"}, {"tokens"}, {"message", "chars"})):
+            raise ValueError('strata_prefix: {"messages": K} (the first K messages), {"message": I, "chars": N} (the first '
+                             'N characters of message I) or {"tokens": N}')
+        for k, v in spec.items():
+            if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "message" else 1):
+                raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
+        if has_images:
+            print("[maya] strata_prefix ignored: the request has images", flush=True)
+            return {}
+        what = ",".join(f"{k}={v}" for k, v in spec.items())
+
+        def lcp(a, b):
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return n
+
+        def head_ids(msgs):
+            """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
+            text, changed = self.render_text(msgs, tools, kwargs, add_generation_prompt=False)
+            cut = text.find(self.PREFIX_END)
+            if cut >= 0:
+                text = text[:cut]
+            return self.encode_text(text, changed)
+
+        if "tokens" in spec:
+            n = spec["tokens"]
+        elif "messages" in spec:
+            k = spec["messages"]
+            if k >= len(messages):
+                print(f"[maya] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and the "
+                      "prefix must leave at least the last one", flush=True)
+                return {}
+            head = head_ids(messages[:k])
+            n = lcp(head, ids)
+        else:
+            i, chars = spec["message"], spec["chars"]
+            text = messages[i].get("content") if 0 <= i < len(messages) else None
+            if not isinstance(text, str) or chars > len(text):
+                print(f"[maya] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
+                return {}
+            cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
+            head = head_ids(cut)
+            n = lcp(head, ids)
+        if n < 1 or n >= len(ids) - 1:
+            print(f"[maya] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
+                  f"(common start {n})", flush=True)
+            return {}
+        return {"tokens": n}
 
     def count_tokens(self, req: dict) -> dict:
         """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
@@ -4347,7 +4460,7 @@ def make_handler(svc: Service):
             try:
                 if cancel.is_set():
                     raise ValueError("generation was cancelled before preparation")
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel, req=sampling)
                 if kw.get("_prefill"):
                     sampling["_prefill"] = kw["_prefill"]
                 effective = {**svc.sampling_defaults, **svc.shared, **sampling}
@@ -4380,7 +4493,7 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, req=req)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
@@ -4473,7 +4586,7 @@ def make_handler(svc: Service):
             svc.check_request(req)                             # a bad sampling field: a 400, now
             messages, tools, kw = anthropic_to_messages(req, deepseek=getattr(svc.template, "deepseek", False))
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, req=req)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
@@ -4528,7 +4641,7 @@ class Server(ThreadingHTTPServer):
 
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
-              "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
+              "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING", "STRATA_DS4_AUTO_PIN",
               "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD") + RESPONSE_ENV_KEYS
 
 

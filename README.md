@@ -1,3 +1,89 @@
+# Project Maya — DeepSeek V4.1 Flash two-GPU expert-helper build
+
+Based on [Project Maya](https://github.com/mw00/project-maya) at commit `249f9a8`, branch
+`deepseek-v4.1-gpu-helper`. Project Maya is an independent project by Peasant Smith; this branch is not endorsed by
+the Maya maintainers.
+
+This build documents and ships one configuration for **DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-IQ2_XXS**: the fast
+RTX 3090 (physical GPU 1, PCIe 4 x16) runs the layers and native vision, and the second RTX 3090 (physical GPU 0,
+slower PCIe) is a **24 GB expert helper**. Its pool holds the most-routed experts the layer card cannot, and those
+picks are summed on GPU 0 instead of the CPU lane. All six routed experts stay enabled; the quantization and context
+are unchanged.
+
+> The upstream README, setup instructions and download links below are Project Maya's and are unchanged. They install
+> upstream Maya; this introduction, the helper preset and the benchmark evidence are the only additions.
+
+## Measured result
+
+Same preserved 8130-token review prompt and 512 greedy tokens (temperature 0), 524288-token allocation, startup
+excluded. Cold request after load, then a repeat that reuses 8129 prompt tokens:
+
+| Request | Prompt | Generated | Prefill | Decode | Wall |
+|---|---:|---:|---:|---:|---:|
+| Cold | 8,130 | 512 | 522.1 tok/s (15.57 s) | **21.35 tok/s** (23.98 s) | 39.56 s |
+| Repeat | 8,130 (8,129 reused) | 512 | 57.4 ms | **25.82 tok/s** (19.83 s) | 19.89 s |
+
+Measured on 2026-10-30 with a fresh build of this branch, engine SHA-256
+`d9e133a6c473f8b06cb35b150b843c8a4dc8c5f60630716faebc2baff6b2db34`; the 2026-10-29 build
+(`88433596c7d236d0d066e4c0fbb50e123900a2945b6696eb0b9886abb25d0e4c`) recorded 21.36 / 25.20 tok/s for the same pair.
+One cold and one repeat request. The measured links were about 26.3 GB/s to GPU 1 and 2.86 GB/s to GPU 0, with no peer
+access. This is a serving run, not a fixed-token microbenchmark: generated continuations can differ and timing moves
+run to run. For the helper's effect on the same engine and prompt, one GPU 1 without the helper measured 15.40 / 19.48
+tok/s (cold / repeat). A separate Strata build on GPU 1 measured 14.87 / 17.97 tok/s; that is a different
+implementation and an external control only.
+
+## What the helper does
+
+The layer GPU keeps as many experts in VRAM as fit. The helper GPU holds a second pool of the most-routed experts the
+layer GPU does not hold, chosen from the expert profile. Its picks run on its own stream while the CPU lane adds the
+sums; a helper failure or a 10-second silence hands the picks back to the CPU lane. Because the sum is computed on the
+helper instead of the CPU, answers can differ in the last bits. Upstream documents the path in
+[docs/SETTINGS.md](docs/SETTINGS.md#deepseek-a-helper-gpu-for-the-experts-vram-leaves-over).
+
+## Configuration
+
+| Physical device | CUDA-visible | Role |
+|---|---|---|
+| GPU 1, fast PCIe 4 x16 | device 0 | layers, attention, native vision (`--gpus 0`, `--tp 1`) |
+| GPU 0, slower PCIe | device 1 | 24 GB expert helper (`DS4_HELPER=1`, not part of `--gpus`) |
+
+`--gpus 0 --tp 1` is intentional: one layer device, not tensor parallelism across the two cards. The portable copy of
+the measured preset is
+[`bench/results/deepseek41-gpu-helper/helper-config.json`](bench/results/deepseek41-gpu-helper/helper-config.json);
+it carries the exact env (`DS4_HELPER=1`, `DS4_HELPER_GB=24`, `DS4_WARM_CAP_GB=98`, `DS4_COPY_GB=98`, the fusion and
+stream switches) and CLI. `CUDA_VISIBLE_DEVICES=1,0` puts the fast card first; verify that order on your machine
+before starting, because the physical indices are machine-specific. Every path in the file is a placeholder.
+
+```sh
+python -m serve.server --engine strata --config bench/results/deepseek41-gpu-helper/helper-config.json
+```
+
+The measured run used a 2.00 bpw uncensored GSQ-RCO IQ2_XXS pack of DeepSeek-V4.1-Flash-1017, not one of the setup's
+Maya quants, with a private pack clone and a private copy of the same expert-profile seed (SHA-256 in the evidence
+file), `--parallel 1`, `--mmap-experts off`, `--suffix-draft 0`, `--dspark none` and `--vision on`. The helper needs
+both `DS4_HELPER_GB` and `DS4_WARM_CAP_GB`; it is Linux/CUDA-only upstream, and the Windows and AMD helper paths are
+untested.
+
+## Limits
+
+- One machine, one thermal state, one cold/repeat pair per configuration; not a sweep.
+- No bit-identity or full-model quality claim. Helper sums and CPU-lane sums can differ in the last bits, and the
+  generated continuations are free-running.
+- All six routed experts remain enabled; no expert dropping, precision reduction or context reduction. DSpark and
+  suffix drafting were off in the measured preset.
+- HIP, Windows and non-3090 GPUs were not validated for this preset.
+
+## Evidence
+
+[`bench/results/deepseek41-gpu-helper/`](bench/results/deepseek41-gpu-helper/) holds the sanitized scalar results, the
+portable preset and the SHA-256 provenance of the original artifacts. No prompts, generated text, token ids, request
+bodies, logs, GPU UUIDs or local paths are published.
+
+---
+
+<sub>**Upstream README follows unchanged.** Everything from this point down is Project Maya's README at commit
+`249f9a8`, kept byte-for-byte; the notes above are the only additions.</sub>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) and MiniMax-M3.1-Flash (428 B) on your own GPU</b><br>

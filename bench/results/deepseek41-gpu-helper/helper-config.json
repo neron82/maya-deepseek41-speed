@@ -1,0 +1,80 @@
+{
+  "_about": "Portable copy of the measured two-GPU expert-helper preset. Replace every <...> placeholder with your own path or device order; no placeholder is a working default. Start it with: python -m serve.server --engine strata --config <this-file> --host 127.0.0.1 --port 8080",
+  "model_name": "deepseek-v4.1-iq2-predict",
+  "exe": "<maya-root>/build/maya-ds4",
+  "cwd": "<maya-root>",
+  "tokenizer": "<deepseek-pack>/tokenizer",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "sampling": {
+    "temperature": 0.0
+  },
+  "gpu_mapping": {
+    "physical_gpu_1": "fast card, PCIe 4 x16: layers, attention and native vision; first CUDA-visible device (CUDA0)",
+    "physical_gpu_0": "slower PCIe card: 24 GB expert helper, second CUDA-visible device (CUDA1); not part of --gpus",
+    "cuda_visible_devices": "The string below puts the fast physical GPU 1 first. Verify that order on your machine (for example with nvidia-smi --query-gpu=index,pci.bus_id,link.gen,link.width) before starting; if your fast card has another index, change the order.",
+    "layer_device": "--gpus 0 selects the first CUDA-visible device (the fast card). --tp 1 means one layer device, intentionally not a tensor-parallel pair.",
+    "helper_device": "DS4_HELPER=1 selects the second CUDA-visible device (the slow card). The helper is not one of --gpus."
+  },
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "1,0",
+    "DS4_HELPER": "1",
+    "DS4_HELPER_GB": "24",
+    "DS4_WARM_CAP_GB": "98",
+    "DS4_COPY_GB": "98",
+    "DS4_INDEX_TC": "1",
+    "DS4_RECENT": "0",
+    "DS4_STREAM_ZC": "1",
+    "DS4_STREAM_WIN": "1",
+    "DS4_LAND": "1",
+    "DS4_Q8_BATCH": "1",
+    "DS4_Q8_CHECK": "1",
+    "DS4_HC_FUSE": "2",
+    "DS4_ROUTE_FUSE": "2",
+    "DS4_DECODE_TRIM": "7",
+    "STRATA_DS4_SLOT_KEEP": "0",
+    "STRATA_DS4_SLOT_CAP": "2",
+    "STRATA_DS4_SLOT_GB": "4"
+  },
+  "args": [
+    "--pack",
+    "<deepseek-pack>",
+    "--gpus",
+    "0",
+    "--tp",
+    "1",
+    "--max-context",
+    "524288",
+    "--reserve-mib",
+    "900",
+    "--vram-experts",
+    "1",
+    "--prefill-chunk",
+    "16384",
+    "--parallel",
+    "1",
+    "--mmap-experts",
+    "off",
+    "--threads",
+    "on",
+    "--suffix-draft",
+    "0",
+    "--dspark",
+    "none",
+    "--expert-profile",
+    "<expert-profile.bin>",
+    "--vision",
+    "on"
+  ],
+  "log": "<run-dir>/engine.log",
+  "gpu": [
+    0,
+    1
+  ],
+  "_checks": [
+    "The pool is DS4_HELPER_GB=24 GB and the host warm cap is DS4_WARM_CAP_GB=98 GB; both are required together.",
+    "The measured run cloned its pack and profile into a private run directory; the profile seed SHA-256 is in results.json.",
+    "DSpark and suffix drafting are off; all six routed experts stay enabled and the quantization is unchanged.",
+    "Keep --parallel 1 for this preset: it is the measured setting."
+  ]
+}

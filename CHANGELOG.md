@@ -4,6 +4,34 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+- **DeepSeek shared starts: an agent and its sub-agents read their system prompt and tools once.** A request that
+  begins with `system`/`developer` messages (or names its own prefix with `"strata_prefix": {"messages": K}`,
+  `{"message": I, "chars": N}` or `{"tokens": N}`) has its shared start resolved against the prompt's own tokens and
+  sent as `pin=N` on the engine's `GEN` line. The engine stops reading at that boundary for a checkpoint - a fourth
+  role beside the last turn's end, the one before it and the anchor, about 2.7 MiB of host RAM a used checkpoint, not
+  VRAM and not per token - and a later request whose prompt agrees up to N goes back to it instead of reading it
+  again; the parked-conversation slots save and restore it like the others. `MAYA_DS4_AUTO_PIN=0` turns the automatic
+  start off; a malformed `strata_prefix` is a 400 and an unusable one is logged and ignored; a request with pictures is
+  never pinned and a picture that differs at the start cuts the state there. `/v1/responses` gets the automatic pin
+  only. Nothing changes for a `GEN` without `pin=`.
+- **DeepSeek GGUFs with Q8_0 Engram tables** (ISTA-DASLab's GSQ-RCO sets: IQ1_M / IQ2_XXS / IQ2_XS experts with the
+  Engram lookup tables in Q8_0) load and read: the tables' whole ggml Q8_0 rows are cached, copied and dequantized
+  with each block's own F16 scale, bit for bit as before. `tools/ds4/pack_gguf.py` also finds the set's Dense-Engram
+  companion shards beside the model's own, so `--model <folder>` packs it without naming them.
+- **DeepSeek vision towers stored in F16 or F32** (ISTA-DASLab's GSQ-RCO vision GGUFs among them) load and run: the
+  tower's reader converts each weight, bias, norm and the picture markers to the BF16 it computes in, nearest even.
+  Existing BF16 packs are read unchanged; F16/F32 input is rounded to the engine's BF16 compute format.
+- **DeepSeek proactive expert cache (rejected, removed):** the earlier `DS4_PREDICT_CACHE=1` histogram placement
+  (a likely expert over a layer's coldest slot on decode ticks) measured slower on its control - 20.5 against 21.8
+  outputs/s, 1502 against 1020 swaps, all cold picks +14.5 % - and is gone, with its knob, its docs and its heat
+  overlay; the demand cache's own rules are unchanged.
+- **DeepSeek two-GPU expert helper, documented and measured:** on two RTX 3090s the fast card (physical GPU 1) runs
+  the layers and native vision while the slower PCIe card (physical GPU 0) takes a 24 GB expert pool. The measured
+  8130-token prompt with 512 greedy tokens went from 15.40 / 19.48 tok/s (cold / repeat) on the layer card alone to
+  21.36 / 25.20 tok/s with the helper. Portable preset, evidence and limits: `bench/results/deepseek41-gpu-helper/`.
+
 ## v1.1.34 - 2026-10-27
 
 DeepSeek and MiniMax answer several requests at once, fixes for one-GPU and tensor-parallel speed, Qwen-3.8-Flash-Next

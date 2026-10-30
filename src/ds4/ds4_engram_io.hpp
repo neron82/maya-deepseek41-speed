@@ -96,8 +96,9 @@ private:
 };
 
 /// One row to fetch: its codes to dst, its scales to scales.  mx8: n bytes at off of a file, [scale, 32 codes] blocks
-/// (a GGUF's MXFP8 row); else n code bytes at off and n2 scale bytes at off2 of file2 (two reads; n2 0: none - a
-/// GGUF's Q6_K row, its scales inside its n bytes).
+/// (a GGUF's MXFP8 row); q8: n bytes at off, one whole ggml Q8_0 row (d and 32 int8 a block, no separate scales);
+/// else n code bytes at off and n2 scale bytes at off2 of file2 (two reads; n2 0: none - a GGUF's Q6_K row, its
+/// scales inside its n bytes).
 struct EgRead {
     int file = -1;
     uint64_t off = 0;
@@ -105,6 +106,7 @@ struct EgRead {
     uint8_t* dst = nullptr;
     uint8_t* scales = nullptr;
     bool mx8 = false;
+    bool q8 = false;
     int file2 = -1;
     uint64_t off2 = 0;
     uint32_t n2 = 0;

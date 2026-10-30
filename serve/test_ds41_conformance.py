@@ -6,7 +6,9 @@ Golden inputs/outputs are unmodified upstream files; see fixtures/deepseek_v41/R
 """
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import os
 import re
@@ -653,6 +655,162 @@ class Images(unittest.TestCase):
             self.assertEqual(ids[start:start + size], [svc.vision.g.image_token] * size)
         self.assertEqual(svc.count_tokens(request), {"tokens": len(ids), "images": 2, "approximate": False,
                                                     "max_context": svc.engine.max_context})
+
+
+class SharedPrefix(unittest.TestCase):
+    """The start an agent and its sub-agents share: a DeepSeek request's system prompt and tools are pinned for the
+    engine (the GEN line's pin=N) unless the start is not a usable prefix; a client's own strata_prefix wins; a
+    request with pictures or another model's template leaves the request as it came."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = ServiceIntegration.DeepSeekTokenizer()
+        cls.svc = Service(MockEngine(cls.tok, "ok"), cls.tok,
+                          ChatTemplate(ROOT / "tools/ds4/chat_template.jinja"))
+
+    def auto_pin(self, value):
+        """STRATA_DS4_AUTO_PIN as a shell sets it (None: unset, the default on)."""
+        old = os.environ.get("STRATA_DS4_AUTO_PIN")
+        if value is None:
+            os.environ.pop("STRATA_DS4_AUTO_PIN", None)
+        else:
+            os.environ["STRATA_DS4_AUTO_PIN"] = value
+        self.addCleanup(lambda: os.environ.pop("STRATA_DS4_AUTO_PIN", None) if old is None
+                        else os.environ.__setitem__("STRATA_DS4_AUTO_PIN", old))
+
+    def prepare(self, messages, tools=None, svc=None, **extra):
+        """The request as a client sends it -> the prepared ids and the request as the engine sees it (with
+        "strata_prefix" resolved)."""
+        request = {"messages": copy.deepcopy(messages), "max_tokens": 16, **extra}
+        if tools is not None:
+            request["tools"] = copy.deepcopy(tools)
+        msgs, schemas, kwargs = openai_to_messages(request, deepseek=True)
+        svc = svc or self.svc
+        ids, _, _ = svc.prepare(msgs, schemas, kwargs, 16, req=request)
+        return ids, request
+
+    MSGS = [{"role": "system", "content": "You answer questions about the document."},
+            {"role": "user", "content": "DOC " * 40},
+            {"role": "assistant", "content": "It says DOC."},
+            {"role": "user", "content": "Which word repeats?"}]
+    SYS = {"role": "system", "content": "You are an agent. " * 20}
+
+    def test_messages_resolve_to_the_turn_start(self):
+        # {"messages": 2}: the first two messages - the prefix ends right where the assistant turn opens
+        ids, request = self.prepare(self.MSGS, strata_prefix={"messages": 2})
+        n = request["strata_prefix"]["tokens"]
+        self.assertTrue(0 < n < len(ids) - 1)
+        self.assertEqual(self.tok.decode(ids[n:n + 1]), "<｜Assistant｜>")
+        self.assertEqual(self.tok.decode(ids[:n]).split("<｜User｜>", 1)[1], "DOC " * 40)
+        msgs, schemas, kwargs = openai_to_messages({"messages": copy.deepcopy(self.MSGS[:2])}, deepseek=True)
+        head, changed = self.svc.render_text(msgs, schemas, kwargs, add_generation_prompt=False)
+        self.assertEqual(ids[:n], self.svc.encode_text(head, changed))
+
+    def test_chars_end_inside_a_message(self):
+        # a document and its question in ONE message: the prefix is the first 160 characters of it
+        text = "DOC " * 40 + "Which word repeats?"
+        ids, request = self.prepare([{"role": "user", "content": text}],
+                                    strata_prefix={"message": 0, "chars": 160})
+        n = request["strata_prefix"]["tokens"]
+        self.assertEqual(self.tok.decode(ids[:n]).split("<｜User｜>", 1)[1], "DOC " * 40)
+        # a system message first: message 1 is the user's
+        ids, request = self.prepare([{"role": "system", "content": "S"}, {"role": "user", "content": text}],
+                                    strata_prefix={"message": 1, "chars": 160})
+        n = request["strata_prefix"]["tokens"]
+        self.assertEqual(self.tok.decode(ids[:n]).split("<｜User｜>", 1)[1], "DOC " * 40)
+
+    def test_tokens_pass_through_and_unusable_prefixes_are_ignored(self):
+        ids, _ = self.prepare(self.MSGS)
+        self.assertEqual(self.prepare(self.MSGS, strata_prefix={"tokens": 100})[1]["strata_prefix"], {"tokens": 100})
+        # no message left after the prefix, no suffix after the boundary, more text than the message has
+        for spec in ({"messages": 4}, {"messages": 9}, {"tokens": len(ids)}, {"message": 1, "chars": 5000},
+                     {"message": 7, "chars": 3}):
+            with self.subTest(spec=spec), contextlib.redirect_stdout(io.StringIO()):
+                _, request = self.prepare(self.MSGS, strata_prefix=spec)
+            self.assertEqual(request["strata_prefix"], {})                  # said in the log, never a refusal
+
+    def test_malformed_specs_are_refused(self):
+        for bad in ({"messages": 0}, {"messages": "2"}, {"messages": True}, {"tokens": 1.5}, {"x": 1},
+                    {"messages": 1, "tokens": 2}, {"message": 1}, {"chars": 3}, {"message": -1, "chars": 3},
+                    {"message": 0, "chars": 0}, [], "pin", {}):
+            with self.subTest(spec=bad), self.assertRaises(ValueError):
+                self.prepare(self.MSGS, strata_prefix=bad)
+
+    def test_the_system_prompt_and_tools_are_the_shared_start(self):
+        self.auto_pin(None)
+        ids, request = self.prepare([self.SYS, {"role": "user", "content": "task one"}], tools=[TOOL])
+        n = request["strata_prefix"]["tokens"]
+        self.assertTrue(0 < n < len(ids) - 1)
+        head = self.tok.decode(ids[:n])
+        self.assertIn("lookup", head)                   # the tools are in the shared start
+        self.assertNotIn("task one", head)              # the first user message is not
+        # another agent behind the same system prompt and tools, another task: the same boundary, the same start
+        ids2, request2 = self.prepare([self.SYS, {"role": "user", "content": "a different task for the sub-agent"}],
+                                      tools=[TOOL])
+        self.assertEqual(request2["strata_prefix"]["tokens"], n)
+        self.assertEqual(ids2[:n], ids[:n])
+
+    def test_no_shared_start_without_a_system_prompt_or_when_switched_off(self):
+        self.auto_pin(None)
+        _, request = self.prepare([{"role": "user", "content": "u"}])
+        self.assertNotIn("strata_prefix", request)      # no system message
+        self.auto_pin("0")
+        ids_b, request = self.prepare([self.SYS, {"role": "user", "content": "u"}])
+        self.assertNotIn("strata_prefix", request)      # switched off
+        self.auto_pin(None)
+        ids_c, request = self.prepare([self.SYS, {"role": "user", "content": "u"}])
+        self.assertIn("strata_prefix", request)         # on by default
+        self.assertEqual(ids_b, ids_c)                  # the pin does not change the prompt
+
+    def test_a_clients_own_prefix_wins(self):
+        self.auto_pin(None)
+        _, request = self.prepare([self.SYS, {"role": "user", "content": "u"}], strata_prefix={"tokens": 7})
+        self.assertEqual(request["strata_prefix"], {"tokens": 7})
+
+    def test_explicit_false_disables_the_automatic_shared_prefix(self):
+        self.auto_pin(None)
+        messages = [self.SYS, {"role": "user", "content": "u"}]
+        ids, automatic = self.prepare(messages)
+        self.assertGreaterEqual(automatic["strata_prefix"]["tokens"], 256)
+        disabled_ids, disabled = self.prepare(messages, strata_prefix=False)
+        self.assertEqual(disabled_ids, ids)
+        self.assertEqual(disabled["strata_prefix"], {})
+
+    def test_another_models_template_gets_no_prefix(self):
+        svc = Service(MockEngine(self.tok, "ok"), self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        request = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]}
+        msgs, tools, kwargs = openai_to_messages(request)
+        svc.prepare(msgs, tools, kwargs, 16, req=request)
+        self.assertNotIn("strata_prefix", request)
+
+    def test_a_request_with_pictures_is_not_pinned(self):
+        self.auto_pin(None)
+
+        class Vision(ds4_vision.Vision):
+            def __init__(self, image_token):
+                self.g = ds4_vision.Geometry(image_token=image_token)
+                self.dir = ROOT / "serve/fixtures/deepseek_v41"
+
+            def picture(self, source):
+                return ds4_vision.Picture(b"", 1, 1, 1, 2)
+
+            def write(self, path, pictures, starts):
+                return path                              # no file, image decoder, or GPU is needed
+
+        svc = Service(MockEngine(self.tok, "ok"), self.tok,
+                      ChatTemplate(ROOT / "tools/ds4/chat_template.jinja"))
+        svc.vision = Vision(self.tok.special_tokens[reference.IMAGE_PLACEHOLDER])
+        messages = [self.SYS, {"role": "user", "content": [{"type": "text", "text": "look"},
+                                                           {"type": "image_url",
+                                                            "image_url": {"url": "a.png"}}]}]
+        request = {"messages": copy.deepcopy(messages), "max_tokens": 16}
+        msgs, tools, kwargs = openai_to_messages(request, deepseek=True)
+        svc.prepare(msgs, tools, kwargs, 16, req=request)
+        self.assertNotIn("strata_prefix", request)      # the automatic start is not pinned
+        request["strata_prefix"] = {"tokens": 50}
+        with contextlib.redirect_stdout(io.StringIO()):
+            svc.prepare(msgs, tools, kwargs, 16, req=request)
+        self.assertEqual(request["strata_prefix"], {})  # said in the log, never sent
 
 
 if __name__ == "__main__":

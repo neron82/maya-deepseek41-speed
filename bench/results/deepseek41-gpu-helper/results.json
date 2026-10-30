@@ -1,0 +1,135 @@
+{
+  "test": "DeepSeek-V4.1-Flash IQ2_XXS, two-GPU expert helper, sustained serving",
+  "measured_utc": "2026-10-30",
+  "model": "DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-IQ2_XXS",
+  "quantization": "IQ2_XXS, 2.00 bpw",
+  "engine": "maya-ds4",
+  "engine_sha256": "d9e133a6c473f8b06cb35b150b843c8a4dc8c5f60630716faebc2baff6b2db34",
+  "plan_sha256": "cbf209b46e4558de311637c4cb5e92b2e7357f36b102fc522ad07c999673ba53",
+  "profile_seed_sha256": "2885f0f638e4f16d3dc8818b99942085cc8c882935fb3bb97a18f0e60f048523",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 3700X, 8 cores / 16 threads, 8 engine threads",
+    "ram_gib": 128,
+    "gpus": "2x NVIDIA RTX 3090 24 GB",
+    "placement": "physical GPU 1 (fast, PCIe 4 x16): layers and native vision; physical GPU 0 (slower PCIe link): 24 GB expert helper",
+    "links": "about 26.3 GB/s to GPU 1 and 2.86 GB/s to GPU 0, no peer access"
+  },
+  "method": "same preserved 8130-token review prompt and 512 greedy output tokens (temperature 0, finish reason length) per request; 524288-token allocation; private copy of the same profile seed; startup excluded; a cold request after load followed by a repeat request that reuses 8129 prompt tokens; serving run, not a fixed-token microbenchmark, so free-generated continuations can differ",
+  "runs": [
+    {
+      "name": "cold",
+      "prompt_tokens": 8130,
+      "generated_tokens": 512,
+      "prefill_ms": 15570.9,
+      "prefill_tok_s": 522.128,
+      "decode_ms": 23984.6,
+      "decode_tok_s": 21.347,
+      "wall_ms": 39555.924,
+      "reused_prompt_tokens": 0,
+      "finish_reason": "length"
+    },
+    {
+      "name": "repeat",
+      "prompt_tokens": 8130,
+      "generated_tokens": 512,
+      "prefill_ms": 57.4,
+      "prefill_tok_s": 141637.631,
+      "decode_ms": 19828.5,
+      "decode_tok_s": 25.821,
+      "wall_ms": 19886.373,
+      "reused_prompt_tokens": 8129,
+      "finish_reason": "length"
+    }
+  ],
+  "reproduction": {
+    "run": "maya-fork-current-helper24-20261030",
+    "engine_sha256": "d9e133a6c473f8b06cb35b150b843c8a4dc8c5f60630716faebc2baff6b2db34",
+    "results_sha256": "c4b4b0ad09f8d9077d4d2d863dddbc36a68d043ba1bdcda5b1d70299a8c3ef21",
+    "meta_sha256": "1b8da51a54bece8f16c19cfeae673ddbfc589e76928ece1b9b3d405f9aaa07dd",
+    "note": "fresh build of this branch on the same machine, prompt and preset"
+  },
+  "recorded_runs_2026_10_29": [
+    {
+      "name": "cold",
+      "engine_sha256": "88433596c7d236d0d066e4c0fbb50e123900a2945b6696eb0b9886abb25d0e4c",
+      "prefill_tok_s": 515.824,
+      "decode_tok_s": 21.361,
+      "wall_ms": 39730.521
+    },
+    {
+      "name": "repeat",
+      "engine_sha256": "88433596c7d236d0d066e4c0fbb50e123900a2945b6696eb0b9886abb25d0e4c",
+      "prefill_tok_s": 136868.687,
+      "decode_tok_s": 25.195,
+      "wall_ms": 20381.637
+    }
+  ],
+  "runtime": {
+    "expert_slots": 1763,
+    "cpu_experts": 13597,
+    "ram_experts": 10858,
+    "helper_pool_gb": 24,
+    "warm_cap_gb": 98,
+    "slot_keep": false,
+    "dspark": "none",
+    "suffix_draft": 0,
+    "routed_experts": 6
+  },
+  "controls": [
+    {
+      "configuration": "Maya fused, GPU 1 only (no helper)",
+      "note": "same engine, same prompt and method, one card",
+      "prefill_tok_s": 506.249,
+      "cold_decode_tok_s": 15.397,
+      "repeat_decode_tok_s": 19.48,
+      "cold_wall_s": 49.3143,
+      "engine_sha256": "42443b52bf2f6458ccb0c52689ba9e55fa91d80c3121491300b5884197872a9d"
+    },
+    {
+      "configuration": "Strata optimized, GPU 1 only",
+      "note": "separate engine implementation, external control only, not the configuration this repository packages",
+      "measured_utc": "2026-10-30",
+      "prefill_tok_s": 413.545,
+      "cold_decode_tok_s": 14.869,
+      "repeat_decode_tok_s": 17.968,
+      "engine_sha256": "5123c5b25acfbd3fde0a45bd1f157ef84705f5ca9085d9d51cfdadb541948fe1"
+    }
+  ],
+  "limits": [
+    "One cold and one repeat request per configuration; not a sweep and not a fixed-token causal isolation.",
+    "The helper sums selected experts on GPU 0 instead of the CPU lane; the engine documents that this can change the last bits of an answer. No bit-identity or full-model quality claim is made.",
+    "All six routed experts remain enabled; no expert dropping, precision reduction or context reduction.",
+    "DSpark drafting and suffix drafting were off.",
+    "Linux and CUDA are the measured path; Windows and AMD helper paths are untested upstream.",
+    "Repeat prefill is small because 8129 prompt tokens were reused from the cold request's cache."
+  ],
+  "provenance": {
+    "raw_helper_results": {
+      "artifact": "project-maya/.omp-deepseek/runs/maya-serving-helper24-fused-final/results.json",
+      "sha256": "e09ce4c8945e3aa549ab2c38d4661c35a201865afdc1c8621bd5d7511c75b18d"
+    },
+    "raw_helper_meta": {
+      "artifact": "project-maya/.omp-deepseek/runs/maya-serving-helper24-fused-final/meta.json",
+      "sha256": "1818a3e34e12d1be2e3202755396e4c28459e6c9bca48d9855996dfe3686ec34"
+    },
+    "helper_plan": {
+      "artifact": "project-maya/.omp-deepseek/plans/maya-helper24-fused-final.json",
+      "sha256": "cbf209b46e4558de311637c4cb5e92b2e7357f36b102fc522ad07c999673ba53"
+    },
+    "maya_single_gpu_control": {
+      "artifact": "project-maya/.omp-deepseek/experiment-summary.json",
+      "sha256": "dd7733ef33e6f96819cd36ca083e0d6b486816394382e980f89bd3b55580ec2b",
+      "run_name": "maya-serving-single-fused"
+    },
+    "strata_external_control": {
+      "artifact": "strata-fork-current-20261030/results.json",
+      "sha256": "d8ee69997e50656ce4b8017631025a28a2358690c67f23e1545fa6234d23b905",
+      "run_meta_sha256": "e97d07faa2db483564a65ab07558975a763f8ce7d3493a524fc76f6df39591c5"
+    }
+  },
+  "sanitisation": [
+    "Only throughput, timing, allocation and configuration scalars are published; token arrays, prompt ids, generated text, request bodies, monitor streams and logs are not.",
+    "No GPU UUIDs, absolute home paths or machine-local profile paths are included; GPU roles are described by physical index and link speed.",
+    "The original artifacts above remain the primary record; this file is a checked scalar extract."
+  ]
+}

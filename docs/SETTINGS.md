@@ -610,7 +610,7 @@ skip any experts, and do not promise a speed increase over a warm page cache.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `DS4_ENGRAM_RAM` | `0` | `1`: map and lock both complete Engram tables before serving. The reader copies rows from the locked mappings, including FP8 scales; an unregistered range fails instead of reading the file. Supports Q6_K, MXFP8 and native FP8 + separate scales. Linux; explicitly requesting it on Windows fails. |
+| `DS4_ENGRAM_RAM` | `0` | `1`: map and lock both complete Engram tables before serving. The reader copies rows from the locked mappings, including FP8 scales; an unregistered range fails instead of reading the file. Supports Q6_K, IQ4_NL, Q8_0 (ISTA-DASLab's GSQ-RCO GGUFs, a whole row with its own F16 scales), MXFP8 and native FP8 + separate scales. Linux; explicitly requesting it on Windows fails. |
 | `DS4_REQUIRE_ALL_RAM` | `0` | `1`, with `--mmap-experts off`: copy every CPU-lane GGUF expert to anonymous RAM. Do not reduce the selection to the available-memory estimate or `DS4_COPY_GB`; insufficient allocation or an incomplete selection fails startup instead of silently leaving experts in their files. |
 
 The second option applies to the GGUF expert-copy path. It does not lock the experts: **locked Engram tables and
@@ -1044,6 +1044,27 @@ engine is unchanged unless asked.
 | `MAYA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size), both written under a temporary name first |
 | `MAYA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
 | `MAYA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete. The engine's end (QUIT or the end of its input) writes the conversations in RAM to the folder, so a restart reads on from them (the server gives it `MAYA_ENGINE_QUIT_S`, 50 s, to do so) |
+| `MAYA_DS4_AUTO_PIN` | on | `0`: no shared start is pinned for a DeepSeek request whose first messages are `system`/`developer`; a client's own `strata_prefix` is still honoured. `1` (or unset): the system prompt and its tools are pinned, so an agent and its sub-agents behind the same start read it once |
+
+A DeepSeek request that begins with `system`/`developer` messages shares that start with every request behind the same
+prompt and tools - an agent and its sub-agents. The server resolves the end of that start against the prompt's own
+tokens and sends it as `pin=N` on the engine's `GEN` line: the engine reads the prompt in two parts there and keeps the
+checkpoint at the boundary (a fourth checkpoint beside the last turn's end, the one before it and the anchor; about
+2.7 MiB of host RAM at a 128-token window, not VRAM and not per token). The next request whose prompt agrees up to N
+goes back to it instead of reading the prefix again; without slots that is within the same conversation run, with
+`MAYA_DS4_SLOT_KEEP=1` the pin travels in the parked conversation. One pinned prefix at a time per engine/conversation:
+a newer pin replaces the older. A prefix shorter than 256 tokens, or one that would leave nothing after it, is read as
+before (no error); a STOP before the boundary leaves no pin, and a restore that goes before a freshly built one drops it.
+
+A client can name its own shared prefix instead: `"strata_prefix": {"messages": K}` (the first K messages),
+`{"message": I, "chars": N}` (the first N characters of message I's text: a document and its question in one message),
+or `{"tokens": N}`. It wins over the automatic start.
+`"strata_prefix": false` opts out of marking a shared start for this request, without clearing existing cached
+checkpoints. A malformed field is a 400, and a prefix that does not match the
+prompt (too long, a message without that much text) is said in the server's window and ignored. A request with
+pictures is never pinned (the engine's picture spans are its own); a prompt whose picture at the start differs is cut
+at that span, so no state crosses it. `/v1/responses` gets the automatic pin only: `strata_prefix` is not part of its
+strict request contract.
 
 The client sends each assistant turn's `reasoning_content` back with the turn, as it got it: from `content` alone the
 prompt differs from the state and nothing is reused - no error and no log line.
