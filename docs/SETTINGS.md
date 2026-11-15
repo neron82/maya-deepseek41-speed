@@ -53,7 +53,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_RESIDENT_SKIP` | AMD: on | while every expert is in VRAM, the decode leaves out each route's wait and fetch launches, which would find nothing to do (two a layer and token); `0` = launch them anyway; `1` = on for NVIDIA too |
 | `MAYA_GLM_FLUSH`, `MAYA_GLM_PREFILL_FLUSH` | off, off | Windows + AMD only, experimental: the HIP runtime holds queued kernels until the host waits; `n` = the decode submits its first layer as soon as it is queued and then every n layers, `1` = the prompt path each sub-batch and each layer's experts (`cudaStreamQuery`, which does not wait). On a Radeon 8065S every 4 layers was ~4% slower than without; prompts no faster |
 | `MAYA_GLM_RAM_RESIDENT` | off | `1` (or `--glm-ram-resident`): the RAM tier holds every expert not in VRAM and nothing is evicted to disk. The start fails if it cannot. For PCs whose RAM holds everything off-card (a 4090 D with 128 GB: decode 1.9x as fast with `PROMOTE_MIN=6`). `MAYA_GLM_RAM_SLACK` is extra slots per MoE layer (default 16) |
-| `MAYA_GLM_SPLIT` | `auto`: a split search on 2-4 GPUs (and on more under DFlash2's pipelined window), by free VRAM with more | the first layer of each later GPU (`24`, or `7,12,17,22,27,32,37,41` for nine); `0` = one GPU. The config's `"layer_split"` sets the same. `auto` prices every placement before loading: each card's room for experts after its layers' weights and state, the share of each layer's routes the experts it then holds take (your usage counts; without them a built-in coverage curve, 1 - (1 - f)^3 of the routes for a share f of a layer's experts, ^1.4 for an EXL3 pack - `MAYA_SPLIT_COVER_B` sets the exponent; EXL3-4.05bpw under DFlash2 over an RTX 3090 and eight 5060 Ti: the 3090 takes 9 layers instead of 7, 63.8 / 32.6 / 64.4 -> 79.8 / 40.4 / 81.9 tok/s), each layer's reads over the card's memory bandwidth and each miss over the host's RAM speed - and takes the fastest one every card can start (on a two-GPU split that drafts with the model's MTP block the two cards work on consecutive tokens, so the token costs the slower card: RTX 3090 + 5060 Ti drafting with a NextN block, 24 -> 26, the cards 25.3 / 32.2 -> 28.1 / 29.8 ms a token, decode +3-5%). Under DFlash2's pipelined window (three GPUs or more) the slowest card paces every draft: the search runs on any number of GPUs (from five, a DP over the layers for each cap on the slowest card), each layer also costs a fixed 0.4 ms (`MAYA_GLM_SPLIT_LAYER_MS`) and a miss is priced at the shared CPU pool's speed, half the host's (Maya-L over an RTX 3090 and eight 5060 Ti: the 3090 takes 8 layers instead of the 10 its VRAM share gave it, 57.1 / 58.9 -> 61.6 / 63.1 tok/s). `MAYA_GLM_SPLIT_LOG=1` prints every placement's prediction |
+| `MAYA_GLM_SPLIT` | `auto`: a split search on 2-4 GPUs (and on more under DFlash2's pipelined window), by free VRAM with more | the first layer of each later GPU (`24`, or `7,12,17,22,27,32,37,41` for nine); `0` = one GPU. The config's `"layer_split"` sets the same. `auto` prices every placement before loading: each card's room for experts after its layers' weights and state, the slots the pool then shapes (a floor a MoE layer, each further slot to the layer whose next-most-routed expert serves the largest share of its lookups, over `expert_counts.txt`/the usage file, as the pool sizes them - a layer without counts takes the mean), the share of each layer's routes the held experts take (the counts' curve; without them a built-in coverage curve, 1 - (1 - f)^3 of the routes for a share f of a layer's experts, ^1.4 for an EXL3 pack - `MAYA_SPLIT_COVER_B` sets the exponent; EXL3-4.05bpw under DFlash2 over an RTX 3090 and eight 5060 Ti: the 3090 takes 9 layers instead of 7, 63.8 / 32.6 / 64.4 -> 79.8 / 40.4 / 81.9 tok/s), each layer's reads over the card's memory bandwidth and each miss over its cheaper road: a timed per-card probe streams one expert off the host (the x4 link's ~3 ms an expert against the x16's ~0.3, `MAYA_SPLIT_PCIE_BPS` pins the rates) and the CPU lane computes the rest - with both in flight an expert prices at its bytes over the two rates added (the share that equalizes the arms), on a shared pool (`MAYA_GLM_CPU_SHARED=1`) one pool of the host parses every part's lane work serially, capped at ~0.62 of the host's RAM read speed per expert (`MAYA_SPLIT_LANE_BPS`/`FRAC`); and what `MAYA_GLM_MISS_SKIP` leaves unrouted prices off the late layers' misses (about 0.57 of them at W 0.16 - `MAYA_SPLIT_SKIP_FRAC` overrides). It takes the fastest one every card can start (on a two-GPU split that drafts with the model's MTP block the two cards work on consecutive tokens, so the token costs the slower card, capped again by the lane's serialize); 2x3090, Ryzen 7, DDR4 it now picks 20/25 and delivered 46 tok/s measured (the sweep's 16/18 ran to 48; the search prices the deep parts conservatively, being unable to see the workload's concentration). Under DFlash2's pipelined window (three GPUs or more) the slowest card paces every draft: the search runs on any number of GPUs (from five, a DP over the layers for each cap on the slowest card), each layer also costs a fixed 0.4 ms (`MAYA_GLM_SPLIT_LAYER_MS`) and a miss is priced at the shared CPU pool's speed, half the host's (Maya-L over an RTX 3090 and eight 5060 Ti: the 3090 takes 8 layers instead of the 10 its VRAM share gave it, 57.1 / 58.9 -> 61.6 / 63.1 tok/s). `MAYA_GLM_SPLIT_LOG=1` prints every placement's prediction |
 | `MAYA_GLM_PARALLEL_LOAD` | on | a split's GPUs load at once, a thread each: they plan their RAM tiers one after another in GPU order (each gets the tier a load one by one gives it), then pin and warm them at the same time (4 x Tesla T4, Maya-L from a cold page cache: start to the first token 142 -> 96 s). `0` = one GPU after another |
 | `MAYA_GLM_CPU_LANE` | one thread per physical core (one GPU, or one pool shared by a split of 3+ GPUs: at most one NUMA node's; two GPUs: half each; cores without SMT: two thirds of them) | CPU threads for RAM-tier experts; `0` = off (the tuning sets it) |
 | `MAYA_GLM_CPU_LANE<n>` | the setting above | the same for CUDA`<n>` alone (`MAYA_GLM_CPU_LANE0=6`, `MAYA_GLM_CPU_LANE1=2`): two cards on links of different speed want different counts - the slower the link, the more CPU threads help. RTX 4070 Ti SUPER on PCIe 3.0 x4 + RTX 5070 Ti on 4.0 x16, split 17: 6 / 2 threads beat the default 4 / 4 |
@@ -610,7 +610,7 @@ skip any experts, and do not promise a speed increase over a warm page cache.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `DS4_ENGRAM_RAM` | `0` | `1`: map and lock both complete Engram tables before serving. The reader copies rows from the locked mappings, including FP8 scales; an unregistered range fails instead of reading the file. Supports Q6_K, MXFP8 and native FP8 + separate scales. Linux; explicitly requesting it on Windows fails. |
+| `DS4_ENGRAM_RAM` | `0` | `1`: map and lock both complete Engram tables before serving. The reader copies rows from the locked mappings, including FP8 scales; an unregistered range fails instead of reading the file. Supports Q6_K, IQ4_NL, Q8_0 (ISTA-DASLab's GSQ-RCO GGUFs, a whole row with its own F16 scales), MXFP8 and native FP8 + separate scales. Linux; explicitly requesting it on Windows fails. |
 | `DS4_REQUIRE_ALL_RAM` | `0` | `1`, with `--mmap-experts off`: copy every CPU-lane GGUF expert to anonymous RAM. Do not reduce the selection to the available-memory estimate or `DS4_COPY_GB`; insufficient allocation or an incomplete selection fails startup instead of silently leaving experts in their files. |
 
 The second option applies to the GGUF expert-copy path. It does not lock the experts: **locked Engram tables and
@@ -1044,6 +1044,27 @@ engine is unchanged unless asked.
 | `MAYA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size), both written under a temporary name first |
 | `MAYA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
 | `MAYA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete. The engine's end (QUIT or the end of its input) writes the conversations in RAM to the folder, so a restart reads on from them (the server gives it `MAYA_ENGINE_QUIT_S`, 50 s, to do so) |
+| `MAYA_DS4_AUTO_PIN` | on | `0`: no shared start is pinned for a DeepSeek request whose first messages are `system`/`developer`; a client's own `strata_prefix` is still honoured. `1` (or unset): the system prompt and its tools are pinned, so an agent and its sub-agents behind the same start read it once |
+
+A DeepSeek request that begins with `system`/`developer` messages shares that start with every request behind the same
+prompt and tools - an agent and its sub-agents. The server resolves the end of that start against the prompt's own
+tokens and sends it as `pin=N` on the engine's `GEN` line: the engine reads the prompt in two parts there and keeps the
+checkpoint at the boundary (a fourth checkpoint beside the last turn's end, the one before it and the anchor; about
+2.7 MiB of host RAM at a 128-token window, not VRAM and not per token). The next request whose prompt agrees up to N
+goes back to it instead of reading the prefix again; without slots that is within the same conversation run, with
+`MAYA_DS4_SLOT_KEEP=1` the pin travels in the parked conversation. One pinned prefix at a time per engine/conversation:
+a newer pin replaces the older. A prefix shorter than 256 tokens, or one that would leave nothing after it, is read as
+before (no error); a STOP before the boundary leaves no pin, and a restore that goes before a freshly built one drops it.
+
+A client can name its own shared prefix instead: `"strata_prefix": {"messages": K}` (the first K messages),
+`{"message": I, "chars": N}` (the first N characters of message I's text: a document and its question in one message),
+or `{"tokens": N}`. It wins over the automatic start.
+`"strata_prefix": false` opts out of marking a shared start for this request, without clearing existing cached
+checkpoints. A malformed field is a 400, and a prefix that does not match the
+prompt (too long, a message without that much text) is said in the server's window and ignored. A request with
+pictures is never pinned (the engine's picture spans are its own); a prompt whose picture at the start differs is cut
+at that span, so no state crosses it. `/v1/responses` gets the automatic pin only: `strata_prefix` is not part of its
+strict request contract.
 
 The client sends each assistant turn's `reasoning_content` back with the turn, as it got it: from `content` alone the
 prompt differs from the state and nothing is reused - no error and no log line.
@@ -1137,6 +1158,30 @@ Engine options, in the config's `"args"`:
 | `--staging` | 48 | expert staging slots a GPU |
 | `--profile` | `data/expert-profile-mm3.bin` | the routing profile: the most-routed experts are placed in VRAM |
 | `--parallel` | 1 | up to N conversations at once (1-8): a KV cache each (the context the engine fits is for every one of them), a token of each running conversation through the model together - the dense matrices read once for all of them, each conversation's attention over its own cache, so each answer is the one it gets alone (greedy, the CPU lane off). On a layer split the GPUs work as a pipeline, each on a different group of the conversations. Above 1: no DSpark drafting, no KV streaming, and `--tp` runs the layer split |
+
+### Single-GPU EXL3 performance
+
+`--tp 1` still uses the CPU expert lane: experts that are not resident or cached on the GPU are computed on the
+CPU. A GPU kernel waiting for the host can count as GPU utilization without doing matrix arithmetic. Profile the
+CLI with `MAYA_MM3_TP_PROF=1` (host time by phase) and `MAYA_MM3_TIMING=1` (decode-only counter deltas);
+`MAYA_MM3_NSYS=N` captures decode tokens 8 through 8+N when launched under Nsight Systems with
+`--capture-range=cudaProfilerApi --capture-range-end=stop`. Do not infer compute headroom from utilization or watts alone.
+
+Mixed-bit EXL3 experts now occupy their actual aligned sizes in the host pool, rather than every expert taking its
+layer's largest size. This can make a previously pageable pool fit in pinned RAM, reduce staging traffic, and avoid
+memory-pressure stalls. GPU slots still use their maximum stride. Decode promotions may use the whole staging cache;
+a subsequent prompt first drains pending promotion copies, then evicts promoted entries when it needs their slots,
+invalidating their old expert mappings. Pending decode copies therefore do not strand slots throughout a prompt.
+
+Mixed-bit prompt experts currently use portable CUDA kernels. Staging slots also have fixed expert classes: when
+one class has too few slots, the prompt planner sends its overflow to the CPU even if slots of another class are
+idle. Check CPU expert work as well as PCIe traffic before attributing slow prefill to GEMMs alone.
+
+For long prompts, compare `--tp-chunk 1024`, `4096`, and `8192` at the same context, prompt, and generation length.
+Larger chunks stage each layer's cold experts fewer times, but take working memory away from resident experts.
+Keep the setting only after measuring decode too. Keep DSpark off unless its measured acceptance and end-to-end
+throughput beat plain decoding; the drafter also consumes VRAM and host working memory. Batching several independent
+requests (`--parallel`) measures aggregate throughput, not the latency of one answer.
 
 **Maya's GGUF quants.** `./maya.sh --setup --model minimax-maya-xs` (or `minimax-maya-s`; before:
 `--model MiniMax-M3.1-Flash --mm3-quant gguf-xs`, which still works) sets up Project Maya's own quants instead of the

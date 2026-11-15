@@ -92,6 +92,17 @@ double now_ms() {
 
 size_t align256(size_t n) { return (n + 255) & ~(size_t) 255; }
 
+// Bytes of one Engram row: the ggml block types sit at the row's start (Q6_K 210 bytes a 256 values, IQ4_NL 18 a 32)
+// and the row's separate scale bytes follow (hd / 32); a Q8_0 row (fmt 3) is ggml's blocks whole, 34 bytes a 32 values
+// with each block's F16 scale inside, and no scale area.  Q8_0's is the largest, so it sizes every buffer that may hold
+// a row of any format.
+size_t eg_row_bytes(int fmt, int hd) { return fmt == 3 ? (size_t) (hd / 32) * 34 : (size_t) hd + hd / 32; }
+// An Engram table's row format from its tensor's dtype: 1 Q6_K, 2 IQ4_NL, 3 Q8_0, 0 MXFP8 / FP8 (codes then E8M0
+// scales); -1: not one the reader handles (the load refuses it later, with its name).
+int eg_fmt_of_dtype(const std::string& d) {
+    return d == "Q6_K" ? 1 : d == "IQ4_NL" ? 2 : d == "Q8_0" ? 3 : d == "MXFP8" || d == "F8_E4M3" ? 0 : -1;
+}
+
 // cudaMemGetInfo for the current device - on Windows, an APU's kept within its DEDICATED memory: HIP counts its
 // carve-out plus shared system memory there, and what fills into the shared part pages (Maya-S on a 160 GB Strix Halo,
 // HIP's 172: 2.45 tok/s - strata/platform/dedicated.hpp).  Its total is then the dedicated memory, its free what of
@@ -289,6 +300,14 @@ float bf16_to_f32(uint16_t b) {
     float f;
     std::memcpy(&f, &u, 4);
     return f;
+}
+// F32 -> BF16 bits, nearest even (ds4_numerics.cuh's bf16_rn on the host): an F16 / F32 tensor the tower reads as
+// BF16, and a NaN stays a NaN
+uint16_t bf16_rn_host(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x40u);
+    return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 float f16_to_f32(uint16_t h) {
     const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 0x1f, m = h & 0x3ff;
@@ -1035,6 +1054,8 @@ struct Model::Impl {
     static constexpr int kMaxChunk = 4 * kVlRows;
     std::vector<std::unique_ptr<Chunk>> chunks;   // per device
     size_t eg_cap = kWin;             // tokens h_eg holds
+    size_t eg_stride = 0;             // bytes a stored Engram row takes at most: the pack's own formats' largest
+                                      // (Q8_0's 34 a 32 only when a table is Q8_0; otherwise the 264 of the others)
     int tap_cap = kWin;               // rows h_taps holds (a chunk seeds the drafter with its last 128)
     static constexpr int kYocoMin = 1024;   // a long prompt's skip (forward_chunks): the fewest rows worth skipping
     bool logits_all = false;          // the last feed was a chunk with logits for every row (chunk_logits)
@@ -1283,7 +1304,8 @@ struct Model::Impl {
     // host side of the CPU lane, a window's rows
     float *h_x = nullptr, *h_w = nullptr, *h_part = nullptr;
     int* h_idx = nullptr;
-    uint8_t* h_eg = nullptr;          // the window's Engram rows: [engram layer][token] of [cols][hd] then the scales
+    uint8_t* h_eg = nullptr;          // the window's Engram rows: [engram layer][token] of [cols] rows (a row: its
+                                      // ggml blocks from its start, then the scales - Q8_0's a whole row)
     // the Engram rows' reader (its own threads and file handles), the rows already fetched, the window's batches (one
     // an Engram layer: asked for when the window's tokens are known, collected right before that layer)
     EgReader eg_io;
@@ -1293,7 +1315,7 @@ struct Model::Impl {
     std::mutex eg_cache_mu;
     std::vector<std::unique_ptr<EgBatch>> eg_win;
     std::vector<uint8_t> eg_q6k;   // Engram layer li's row format: 1 ggml Q6_K (superblocks of 256), 2 IQ4_NL (blocks of
-                                   // 32), 0 FP8
+                                   // 32), 3 ggml Q8_0 (blocks of 32, each d inside), 0 FP8 (codes, then E8M0 scales)
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     std::atomic<int64_t> eg_pf_rows_n{0}, eg_pf_hits_n{0}, eg_pf_reads_n{0}, eg_pf_wait_ns{0}, eg_pf_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
@@ -1307,10 +1329,13 @@ struct Model::Impl {
         std::vector<std::vector<uint8_t>> win;
         std::vector<std::vector<float>> comp;
     };
-    Check ck[3];                      // the end of the last prompt, the position before it, and the anchor: the
-                                      // position before the end of the first prompt of the run of prompts that each
-                                      // continued the last in place (a chat template that drops earlier turns'
-                                      // reasoning at a new user message re-renders the history from about there)
+    static constexpr int kChecks = 4;
+    Check ck[kChecks];                // the end of the last prompt, the position before it, the anchor (the position
+                                      // before the end of the first prompt of the run of prompts that each continued
+                                      // the last in place: a chat template that drops earlier turns' reasoning at a new
+                                      // user message re-renders the history from about there) and the prefix (where the
+                                      // server said the prompt's shared start - system prompt and tools - ends: another
+                                      // agent behind the same start goes back to it)
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
     // --parallel (Options::seqs > 1): every conversation's state.  The bound one's host state lives in the fields above
     // (pos, toks, ctoks, ck, slot_held) and its device buffers in the layers and the sources; seq_park() moves that
@@ -1319,7 +1344,7 @@ struct Model::Impl {
     struct SeqState {
         int64_t pos = 0;
         std::vector<int32_t> toks, ctoks;
-        Check ck[3];
+        Check ck[kChecks];
         bool slot_held = false;
         std::vector<uint8_t*> win;                   // [layer member] (sq_base[layer] + member)
         std::vector<float*> c_kv, c_score;
@@ -2885,6 +2910,18 @@ struct Model::Impl {
                   std::to_string(g.ix_hd) + ", experts per token " + std::to_string(g.k_exp) + ")";
             return false;
         }
+        // The Engram row a buffer must hold at most, from the tables the pack actually has, once: 264 bytes a row for
+        // the Q6_K / IQ4_NL / FP8 tables, 272 when a Q8_0 one is among them.  Every per-layer row stride below is the
+        // format's own (eg_row_bytes); only the shared buffers' capacity and layer spacing use this.
+        eg_stride = 0;
+        for (int li = 0; li < pk.eg_layers && (size_t) li < g.eg_layers.size(); ++li) {
+            const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
+            const int fmt = tw != nullptr ? eg_fmt_of_dtype(tw->dtype) : -1;
+            eg_stride = std::max(eg_stride, eg_row_bytes(fmt < 0 ? 0 : fmt, pk.eg_hd));
+        }
+        if (pk.eg_layers > 0 && eg_stride == 0) eg_stride = eg_row_bytes(0, pk.eg_hd);   // (no table found: the load
+                                                                                       //  refuses it below; keep the
+                                                                                       //  buffers' arithmetic safe)
         freqs_win = rope_freqs(g.rd, 0, g.rope_theta, g.factor, g.beta_fast, g.beta_slow);
         freqs_comp = rope_freqs(g.rd, g.orig_ctx, g.comp_theta, g.factor, g.beta_fast, g.beta_slow);
 
@@ -3074,8 +3111,9 @@ struct Model::Impl {
                              tp, g.ff, blk, fa, fb);
             } else
                 tp_uneven = false;
-        } else
+        } else {
             tp_uneven = false;
+        }
         // the groups: runs of tp devices of one kind (their memory), a device unlike the next alone
         // - or, tp the number of GPUs, one group of all of them whatever their kind (its tightest member sets the
         // experts' room); threads mode for the windows (decode) where a group is 2 wide or more or --threads on, the
@@ -3479,7 +3517,7 @@ struct Model::Impl {
                 return false;
             if (!g.eg_layers.empty()) {
                 const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
-                ok = dalloc(d, d.eg_rows, W * cols * (pk.eg_hd + pk.eg_hd / 32), err) &&
+                ok = dalloc(d, d.eg_rows, W * cols * eg_stride, err) &&
                      dalloc(d, d.eg_x, W * cols * pk.eg_hd, err) && dalloc(d, d.eg_kv, W * (g.hc + 1) * D, err);
                 if (!ok) return false;
             }
@@ -3697,12 +3735,12 @@ struct Model::Impl {
         if (!halloc(h_x, (size_t) kWin * g.dim, err) || !halloc(h_w, (size_t) kWin * kPicks, err) ||
             !halloc(h_part, (size_t) kWin * g.dim, err) || !halloc(h_idx, (size_t) kWin * kPicks, err) ||
             !halloc(h_emb, (size_t) std::max(kWin, chunk) * g.dim, err) ||
-            !halloc(h_eg, (size_t) std::max(1, pk.eg_layers) * eg_cap * cols * (pk.eg_hd + pk.eg_hd / 32) + 64, err))
+            !halloc(h_eg, (size_t) std::max(1, pk.eg_layers) * eg_cap * cols * eg_stride + 64, err))
             return false;
         if (pk.eg_layers > 0) {
             // the Engram rows' reader: threads enough to keep an SSD's queue busy (reads from the page cache need few);
             // the row cache a small share of the RAM free (DS4_ENGRAM_CACHE_MB: its size, 0 off; DS4_ENGRAM_THREADS)
-            const size_t row = (size_t) pk.eg_hd + pk.eg_hd / 32;
+            const size_t row = eg_stride;   // (the largest row the pack's tables need: Q8_0's only if one is there)
 #if defined(_WIN32)
             // (Windows: each thread's ReadFile is synchronous, so the threads are the queue depth - a 28K-token prompt
             //  in one chunk, 1.36M rows before layer 1: 10 threads 17.1 s, 32 14.1 s, 64 13.4 s on a 20-core PC)
@@ -3743,8 +3781,8 @@ struct Model::Impl {
                 uint64_t total = 0;
                 for (int li = 0; li < pk.eg_layers; ++li) {
                     const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "IQ4_NL" && tw->dtype != "MXFP8" &&
-                                          tw->dtype != "F8_E4M3")) {
+                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "IQ4_NL" && tw->dtype != "Q8_0" &&
+                                          tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3")) {
                         err = "Engram RAM: unsupported table type"; return false;
                     }
                     if (!eg_io.pin_range(paths[(size_t) tw->file], tw->file, tw->off, tw->bytes, err)) return false;
@@ -3757,30 +3795,38 @@ struct Model::Impl {
                     }
                 }
                 eg_io.require_ram();
-                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/IQ4_NL/FP8), %.3f GB locked; reads use memcpy\n",
+                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/IQ4_NL/Q8_0/FP8), %.3f GB locked; reads use memcpy\n",
                              pk.eg_layers, (double) total / 1e9);
             }
             eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-                const bool q6k = tw != nullptr && tw->dtype == "Q6_K", iq4 = tw != nullptr && tw->dtype == "IQ4_NL";
-                if ((q6k && pk.eg_hd % 256 != 0) || (iq4 && pk.eg_hd % 32 != 0)) {
+                const int ef = tw != nullptr ? eg_fmt_of_dtype(tw->dtype) : -1;
+                const bool q6k = ef == 1, iq4 = ef == 2, q8 = ef == 3;
+                if ((q6k && pk.eg_hd % 256 != 0) || ((iq4 || q8) && pk.eg_hd % 32 != 0)) {
                     err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": " + tw->dtype + " rows of " +
                           std::to_string(pk.eg_hd) + " values (not whole blocks)";
                     return false;
                 }
-                if (tw != nullptr && !q6k && !iq4 && tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3") {
-                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": tables in " + tw->dtype +
-                          " (the engine reads Q6_K, IQ4_NL, MXFP8 or FP8)";
+                if (q8 && tw->bytes % ((uint64_t) pk.eg_hd / 32 * kQ8_0Bytes) != 0) {   // (whole Q8_0 rows)
+                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": " + std::to_string(tw->bytes) +
+                          " bytes of Q8_0 rows that are not whole " + std::to_string(pk.eg_hd / 32 * kQ8_0Bytes) +
+                          "-byte rows";
                     return false;
                 }
-                eg_q6k.push_back(q6k ? 1 : iq4 ? 2 : 0);
+                if (ef < 0) {
+                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": " +
+                          (tw != nullptr ? "tables in " + tw->dtype : std::string("no engram.embed.weight")) +
+                          " (the engine reads Q6_K, IQ4_NL, Q8_0, MXFP8 or FP8)";
+                    return false;
+                }
+                eg_q6k.push_back((uint8_t) ef);
             }
             if (o.verbose)
                 std::fprintf(stderr, "ds4: Engram rows read on %d threads, issued with the tokens, collected before "
-                                     "their layer; row cache %llu MB (%zu rows)\n",
-                             nth, (unsigned long long) mb, eg_cache.capacity());
+                                     "their layer; row cache %llu MB (%zu rows), rows up to %zu B\n",
+                             nth, (unsigned long long) mb, eg_cache.capacity(), eg_stride);
         }
         prof.assign((size_t) (g.nl + g.n_mtp) * g.n_exp, 0u);
         if (!o.profile.empty()) {
@@ -4139,7 +4185,7 @@ struct Model::Impl {
             put(c.pos, Z * kPicks), put(c.sg, Z * FF), put(c.su, Z * FF), put(c.sh16, Z * FF), put(c.h16, Z * FF);
             put(c.y, Z * D + 32);   // (+32: allreduce_dma's FP16 pieces in it)
             if (c.has_first) put(c.emb, Z * D);
-            if (c.has_eg) put(c.eg_rows, Z * cols * (ehd + ehd / 32));
+            if (c.has_eg) put(c.eg_rows, Z * cols * eg_stride);
         }
         return off;
     }
@@ -4222,7 +4268,7 @@ struct Model::Impl {
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
         const int D = g.dim;
-        const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
+        const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
         // a device whose trunk layers will all be on the flow (as in load(): a GGUF's in-place experts, each layer on
         // it alone) lends its buffers' room to its experts between prompts - on one GPU (DS4_BORROW=1: on more too,
         // =0: its own room, as before)
@@ -4306,7 +4352,7 @@ struct Model::Impl {
             for (int sl = 0; sl < 2; ++sl) {
                 if (hands && (!hmap(c.hand[sl], chunk_hand_bytes(), err) || !hmap(c.hand_flag[sl], 32, err))) return false;
                 if (has_first && !halloc(c.emb_host[sl], C * D, err)) return false;
-                if (has_eg && !halloc(c.eg_host[sl], C * pk.eg_layers * (size_t) cols * (ehd + ehd / 32), err)) return false;
+                if (has_eg && !halloc(c.eg_host[sl], C * pk.eg_layers * (size_t) cols * eg_stride, err)) return false;
                 CK(cudaEventCreateWithFlags(&c.emb_ev[sl], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&c.eg_ev[sl], cudaEventDisableTiming));
             }
@@ -4628,7 +4674,7 @@ struct Model::Impl {
             double nb = 0;
             if (l0.dev == di)
                 for (int i = 0; i < bt.n; ++i) {
-                    const int e = l0.host_list[(size_t) (bt.j0 + i)];
+                    const int e = l0.host_list[(size_t) (bt.j0 + i)];   // (its first member's: the regions are the same)
                     if (l0.lay.fmt == gg::kFmtMXFP4) {
                         if (copy_mode && l0.ram[(size_t) e] >= 0) continue;   // (in RAM: nothing to read)
                         for (int r = 0; r < 3; ++r)
@@ -4721,18 +4767,19 @@ struct Model::Impl {
             int mi = 0;
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di) mi = m;
+            const std::vector<int>& hl = l0.host_list;
             if (S.cp >= (size_t) P) CK(cudaStreamWaitEvent(c.cs, c.freed[half], 0));
             uint8_t* sb = nullptr;   // in place: the batch's regions in the part's staging slots
             bool staged = false;     // (a batch of copies in place, alone: nothing to stage)
             for (int i = 0; i < bt.n && !staged; ++i)
-                staged = stage_needed(l0, l0.host_list[(size_t) (bt.j0 + i)]);
+                staged = stage_needed(l0, hl[(size_t) (bt.j0 + i)]);
             if (c.stage != nullptr && staged) {
                 if (S.cp >= (size_t) P) CK(cudaEventSynchronize(c.filled[half]));   // (its last batch's copies out)
                 sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
                 std::atomic<bool> bad{false};
                 c.readers->run(bt.n, [&](int i) {
                     if (!picked(i)) return;   // (DS4_SKIP_UNPICKED: an expert no token routed to)
-                    if (!stage_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb + (size_t) i * c.stage_stride))
+                    if (!stage_streamed(l0, mi, hl[(size_t) (bt.j0 + i)], sb + (size_t) i * c.stage_stride))
                         bad.store(true);
                 });
                 if (bad.load()) {
@@ -4744,7 +4791,7 @@ struct Model::Impl {
                 if (!picked(i)) { ++S.skipped; continue; }
                 if (skip_unpicked) ++S.copied;
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
-                if (!copy_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
+                if (!copy_streamed(l0, mi, hl[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
                                                                                              : nullptr,
                                    dst, c.cs, err))
                     return false;
@@ -4986,7 +5033,8 @@ struct Model::Impl {
         // 21 of 1568, the early reads 9-12% faster there)
         static const double waste = std::getenv("DS4_SPEC_WASTE") ? std::atof(std::getenv("DS4_SPEC_WASTE")) : 0.2;
         const bool early = c.it_spec < 2u * (uint64_t) c.ring_n || (double) c.it_spec_unused <= waste * (double) c.it_spec;
-        for (int e : l.host_list) {
+        const std::vector<int>& hl = l.host_list;
+        for (int e : hl) {
             if (!early) break;
             const double p = sum > 0 ? pr[e] / sum : 0.0;
             const double q = p >= 1.0 ? 1.0 : 1.0 - std::exp(picks * std::log1p(-p));
@@ -5002,7 +5050,7 @@ struct Model::Impl {
             vs[x.second] = l.pv_n + j++;
             is[(size_t) x.second] = 1;
         }
-        for (int e : l.host_list)
+        for (int e : hl)
             if (!is[(size_t) e]) vs[e] = l.pv_n + j++;
         for (const auto& x : cand) flow_push(c, l, mi, k, x.second, vs[x.second]);
         c.n_spec = (int) cand.size();
@@ -5017,7 +5065,8 @@ struct Model::Impl {
             const int v = fit(c, i).v;
             if (b[(size_t) v + 1] == b[(size_t) v]) ++c.it_spec_unused;
         }
-        for (int e : l.host_list) {   // (index order: their virtual slots ascending)
+        const std::vector<int>& hl = l.host_list;
+        for (int e : hl) {   // (index order: their virtual slots ascending)
             const int v = vs[e];
             if (v >= l.pv_n + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
         }
@@ -5892,7 +5941,7 @@ struct Model::Impl {
                 const double budget = *std::min_element(mroom.begin(), mroom.end());
                 double all = 0;
                 for (const Layer& l : L)
-                    if (l.grp == (int) gi) all += (double) unit(l) * l.n_exp;
+                    if (l.grp == (int) gi) all += ucount(l) * l.n_exp;
                 const double nm = (double) groups[gi].mem.size(), capped = std::min(budget, room / nm);
                 kept += std::max(0.0, std::min(budget, all) - std::min(capped, all)) * nm;
                 for (double& r : mroom) r = std::min(r, capped);
@@ -7575,7 +7624,7 @@ struct Model::Impl {
         q.pos = pos;
         q.toks = std::move(toks);
         q.ctoks = std::move(ctoks);
-        for (int i = 0; i < 3; ++i) q.ck[i] = std::move(ck[i]);
+        for (int i = 0; i < kChecks; ++i) q.ck[i] = std::move(ck[i]);
         q.slot_held = slot_held;
         toks.clear();
         ctoks.clear();
@@ -7585,7 +7634,7 @@ struct Model::Impl {
         pos = q.pos;
         toks = std::move(q.toks);
         ctoks = std::move(q.ctoks);
-        for (int i = 0; i < 3; ++i) ck[i] = std::move(q.ck[i]);
+        for (int i = 0; i < kChecks; ++i) ck[i] = std::move(q.ck[i]);
         slot_held = q.slot_held;
         q.toks.clear();
         q.ctoks.clear();
@@ -7625,7 +7674,7 @@ struct Model::Impl {
         toks.clear();
         ctoks.clear();
         slot_held = false;
-        ck[0].pos = ck[1].pos = ck[2].pos = -1;
+        for (Check& c : ck) c.pos = -1;
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
                 Layer& l = member(l0, m);
@@ -7644,7 +7693,7 @@ struct Model::Impl {
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
-        Check& c = ck[slot & 1];
+        Check& c = ck[slot & (kChecks - 1)];
         c.pos = pos;
         c.win.resize(L.size());
         c.comp.resize(L.size() * 2);
@@ -7671,7 +7720,7 @@ struct Model::Impl {
     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
     int best_check(int64_t limit) const {
         int b = -1;
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < kChecks; ++i)
             if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
         return b;
     }
@@ -7694,10 +7743,10 @@ struct Model::Impl {
         std::sort(v.rbegin(), v.rend());
         return v;
     }
-    // the checkpoints a slot keeps (each with its role: 0, 1 or the anchor)
+    // the checkpoints a slot keeps (each with its role: 0, 1, the anchor or the prefix)
     std::vector<int> slot_checks() const {
         std::vector<int> v;
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < kChecks; ++i)
             if (ck[i].pos > 0 && ck[i].pos <= pos && ck[i].win.size() == L.size()) v.push_back(i);
         return v;
     }
@@ -8044,7 +8093,7 @@ struct Model::Impl {
             }
             off += cb + ib;
         }
-        Check got[3];   // the slot's checkpoints: the positions it can be taken back at
+        Check got[kChecks];   // the slot's checkpoints: the positions it can be taken back at
         {
             uint64_t nc = 0;
             if (!room(8)) {
@@ -8053,7 +8102,7 @@ struct Model::Impl {
             }
             std::memcpy(&nc, data + off, 8);
             off += 8;
-            if (nc > 3) {
+            if (nc > (uint64_t) kChecks) {
                 err = "the slot's checkpoints are damaged";
                 return false;
             }
@@ -8066,7 +8115,7 @@ struct Model::Impl {
                 std::memcpy(&role, data + off, 8);
                 std::memcpy(&cp, data + off + 8, 8);
                 off += 16;
-                if (role > 2 || got[role].pos >= 0 || cp == 0 || cp > (uint64_t) n_pos) {
+                if (role >= (uint64_t) kChecks || got[role].pos >= 0 || cp == 0 || cp > (uint64_t) n_pos) {
                     err = "the slot's checkpoints are damaged";
                     return false;
                 }
@@ -8113,7 +8162,7 @@ struct Model::Impl {
                            : (toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0);
         imgs.clear();   // (the slot holds no rows: a span the prompt feeds again is encoded again)
         if (pics != nullptr) *pics = std::move(marks);
-        for (int k = 0; k < 3; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
+        for (int k = 0; k < kChecks; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
         slot_held = false;
         ok = true;
@@ -8172,6 +8221,22 @@ struct Model::Impl {
     bool vis_hold = false;               // keep it from one encode_image to the next, till vision_release
     std::function<void()> vis_note;      // after the room is taken and after it is given back (the VRAM lines)
     double vis_ms = 0;                   // the last lending's cost: taking the room and giving it back
+    // Vision tensors as the tower reads them, BF16 bits: a pack may store BF16, F16 or F32.
+    // F16 / F32 round to nearest even, as ds4_numerics.cuh's bf16_rn does.
+    bool read_bf16(const Tensor& t, size_t n, void* dst) {
+        if (t.dtype == "BF16") return t.bytes == n * 2 && pk.read(t, dst);
+        uint16_t* out = (uint16_t*) dst;
+        if (t.dtype == "F16") {
+            if (t.bytes != n * 2 || !pk.read(t, dst)) return false;
+            for (size_t i = 0; i < n; ++i) out[i] = bf16_rn_host(f16_to_f32(out[i]));
+            return true;
+        }
+        if (t.dtype != "F32" || t.bytes != n * 4) return false;
+        std::vector<float> f(n);
+        if (!pk.read(t, f.data())) return false;
+        for (size_t i = 0; i < n; ++i) out[i] = bf16_rn_host(f[i]);
+        return true;
+    }
     bool load_vision(std::string& err) {
         vg.layers = (int) pk.num("vision.num_hidden_layers", 0);
         const int tok = (int) pk.num("image_token_id", -1);
@@ -8184,18 +8249,31 @@ struct Model::Impl {
         for (int i = 0; i < 3; ++i) {
             const Tensor* t = pk.get(mark[i]);
             img_mark[i].resize((size_t) g.dim);
-            if (t == nullptr || t->dtype != "BF16" || t->bytes != (uint64_t) g.dim * 2 || !pk.read(*t, img_mark[i].data())) {
-                err = std::string(mark[i]) + ": not a BF16 row of the model's width";
+            if (t == nullptr || !read_bf16(*t, (size_t) g.dim, img_mark[i].data())) {
+                err = std::string(mark[i]) + ": not a BF16, F16 or F32 row of the model's width";
                 return false;
             }
         }
         const double t0 = now_ms();
         Dev& d = devs[0];
+        // The tower reads BF16 whatever the pack stores (BF16, F16 or F32); a GGUF's vision tower may keep its mlp's
+        // gate and up apart, which are the two halves of w1's rows.
         auto read = [this](const std::string& n, std::vector<int64_t>& shape, void* dst) {
             const Tensor* t = pk.get(n);
-            if (t == nullptr || t->dtype != "BF16") return false;
+            if (t == nullptr && n.size() > 13 && n.compare(n.size() - 13, 13, "mlp.w1.weight") == 0) {
+                const std::string pre = n.substr(0, n.size() - 13);
+                const Tensor* tg = pk.get(pre + "mlp.gate.weight");
+                const Tensor* tu = pk.get(pre + "mlp.up.weight");
+                if (tg == nullptr || tu == nullptr || tg->shape.size() != 2 || tg->shape != tu->shape) return false;
+                shape = {tg->shape[0] * 2, tg->shape[1]};
+                const size_t half = (size_t) tg->shape[0] * (size_t) tg->shape[1];
+                return dst == nullptr || (read_bf16(*tg, half, dst) && read_bf16(*tu, half, (uint16_t*) dst + half));
+            }
+            if (t == nullptr) return false;
             shape = t->shape;
-            return dst == nullptr || pk.read(*t, dst);
+            size_t n_el = 1;
+            for (int64_t x : t->shape) n_el *= (size_t) x;
+            return dst == nullptr || read_bf16(*t, n_el, dst);
         };
         if (!vt.load(vg, d.id, read, err)) return false;
         img_tok = tok;
@@ -8391,7 +8469,8 @@ struct Model::Impl {
     }
 
     // ---- Engram: a window's rows of one table (Engram layer li), tokens p0 .. p0 + T - 1 into dst ([token] of [cols]
-    // [hd] codes then the scales; nullptr: h_eg).  eg_issue serves the rows already fetched from the row cache (and a
+    // rows - an fmt-dependent row: its ggml blocks from its start, then the scales - Q8_0's the whole row; nullptr:
+    // h_eg).  eg_issue serves the rows already fetched from the row cache (and a
     // row the window needs twice from one read) and hands the rest to the reader's threads; eg_finish waits for them,
     // copies the repeats and keeps the new rows in the cache.  The rows are the file's bytes either way.
     // (rows: a multi step's - row t is conversation rows->rseq[t]'s token at rows->rpos[t], its look-back in that
@@ -8399,15 +8478,18 @@ struct Model::Impl {
     void eg_issue(int64_t p0, int T, int li, uint8_t* dst, EgBatch& b, bool account = true, bool submit = true,
                   bool defer_dups = false, const WinPlan* rows = nullptr) {
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
-        const size_t per = (size_t) cols * (hd + hd / 32);
+        const int fmt = eg_q6k[(size_t) li];
+        const bool q8 = fmt == 3;                    // (whole Q8_0 rows: no scale area after them)
+        const size_t row = eg_row_bytes(fmt, hd), per = (size_t) cols * row;
+        const size_t lp = (size_t) cols * eg_stride;   // a layer's rows in h_eg (the pack's largest row)
         b.clear();
         b.reads.reserve((size_t) T * cols);
         const std::string P = "layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.";
         const Tensor* tw = pk.get(P + "weight");
         const Tensor* ts = pk.get(P + "scale");
-        const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
-        const bool q6k = eg_q6k[(size_t) li] == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
-        const bool iq4 = eg_q6k[(size_t) li] == 2;   // (IQ4_NL blocks of 32, their scales inside)
+        const bool mx8 = fmt == 0;   // (a GGUF: the scales between the codes, one per 32)
+        const bool q6k = fmt == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
+        const bool iq4 = fmt == 2;   // (IQ4_NL blocks of 32, their scales inside)
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         if (!defer_dups) first.reserve((size_t) T * cols);
         int64_t hits = 0;
@@ -8416,8 +8498,9 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t) {
                 const int64_t p = rows != nullptr ? rows->rpos[t] : p0 + t;
                 const std::vector<int32_t>& ct = rows != nullptr ? sqs[(size_t) rows->rseq[t]].ctoks : ctoks;
-                uint8_t* rd0 = dst != nullptr ? dst + (size_t) t * per : h_eg + ((size_t) li * eg_cap + t) * per;
-                uint8_t* scales = rd0 + (size_t) cols * hd;
+                uint8_t* rd0 = dst != nullptr ? dst + (size_t) t * per
+                                              : h_eg + (size_t) li * eg_cap * lp + (size_t) t * per;
+                uint8_t* scales = q8 ? nullptr : rd0 + (size_t) cols * hd;
                 if (ct[(size_t) p] < 0) {   // a picture's token: no rows (zeros: its gate adds nothing)
                     std::memset(rd0, 0, per);
                     continue;
@@ -8435,12 +8518,15 @@ struct Model::Impl {
                     for (int h = 0; h < pk.eg_heads; ++h) {
                         const int c = (n - 1) * pk.eg_heads + h;
                         const int64_t id = rolling % pk.eg_primes[(size_t) li * cols + c] + pk.eg_off[(size_t) li * cols + c];
-                        uint8_t* rd = rd0 + (size_t) c * hd;
-                        uint8_t* sd = scales + (size_t) c * (hd / 32);
+                        uint8_t* rd = rd0 + (size_t) c * (q8 ? row : (size_t) hd);
+                        uint8_t* sd = q8 ? nullptr : scales + (size_t) c * (hd / 32);
                         const uint64_t key = (uint64_t) id * 8 + (uint64_t) li;
                         if (const uint8_t* hit = eg_cache.find(key)) {
-                            std::memcpy(rd, hit, (size_t) hd);
-                            std::memcpy(sd, hit + hd, (size_t) hd / 32);
+                            if (q8) std::memcpy(rd, hit, row);
+                            else {
+                                std::memcpy(rd, hit, (size_t) hd);
+                                std::memcpy(sd, hit + hd, (size_t) hd / 32);
+                            }
                             ++hits;
                             continue;
                         }
@@ -8460,6 +8546,10 @@ struct Model::Impl {
                         if (mx8) {
                             r.mx8 = true;
                             r.n = (uint32_t) (hd / 32 * 33);
+                            r.off = tw->off + (uint64_t) id * r.n;
+                        } else if (q8) {   // (one whole Q8_0 row: its blocks' d inside)
+                            r.q8 = true;
+                            r.n = (uint32_t) row;
                             r.off = tw->off + (uint64_t) id * r.n;
                         } else if (q6k || iq4) {   // (into the row's code bytes; its scale bytes unused)
                             r.n = (uint32_t) (q6k ? hd / 256 * 210 : hd / 32 * 18);
@@ -8495,11 +8585,14 @@ struct Model::Impl {
             for (const auto& d : b.dups) {
                 const EgRead& r = b.reads[(size_t) d.first];
                 if (b.ok[(size_t) d.first] == 1) {
-                    std::memcpy(d.second.first, r.dst, (size_t) hd);
-                    std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
+                    if (r.q8) std::memcpy(d.second.first, r.dst, r.n);
+                    else {
+                        std::memcpy(d.second.first, r.dst, (size_t) hd);
+                        std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
+                    }
                 } else {   // a failed canonical read must not publish uninitialised duplicate destinations
-                    std::memset(d.second.first, 0, (size_t) hd);
-                    std::memset(d.second.second, 0, (size_t) hd / 32);
+                    std::memset(d.second.first, 0, r.q8 ? (size_t) r.n : (size_t) hd);
+                    if (!r.q8) std::memset(d.second.second, 0, (size_t) hd / 32);
                 }
             }
             {
@@ -8508,13 +8601,16 @@ struct Model::Impl {
                     const EgRead& r = b.reads[i];
                     if (b.ok[i] == 2) continue;   // sorted duplicate: copied above; only the canonical enters the cache
                     if (!b.ok[i]) {   // (a failed read: zeros, its gate adds nothing; not kept)
-                        std::memset(r.dst, 0, (size_t) hd);
-                        std::memset(r.scales, 0, (size_t) hd / 32);
+                        std::memset(r.dst, 0, r.q8 ? (size_t) r.n : (size_t) hd);
+                        if (!r.q8) std::memset(r.scales, 0, (size_t) hd / 32);
                         continue;
                     }
                     if (uint8_t* c = eg_cache.put(r.key)) {
-                        std::memcpy(c, r.dst, (size_t) hd);
-                        std::memcpy(c + hd, r.scales, (size_t) hd / 32);
+                        if (r.q8) std::memcpy(c, r.dst, r.n);
+                        else {
+                            std::memcpy(c, r.dst, (size_t) hd);
+                            std::memcpy(c + hd, r.scales, (size_t) hd / 32);
+                        }
                     }
                 }
             }
@@ -14282,14 +14378,15 @@ struct Model::Impl {
         // Engram, in slabs of 256 tokens
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
-            const size_t per = (size_t) cols * (ehd + ehd / 32);
+            const int efmt = eg_q6k[(size_t) l.eg];
+            const size_t per = (size_t) cols * eg_row_bytes(efmt, ehd), lp = (size_t) cols * eg_stride;
             const int slot = wp.eg_slot >= 0 ? wp.eg_slot : wp.k % 2;   // (read ahead by the run: two in flight)
-            uint8_t* host = chunks[(size_t) eg_src_dev(l.dev)]->eg_host[slot] + (size_t) l.eg * c.C * per;
+            uint8_t* host = chunks[(size_t) eg_src_dev(l.dev)]->eg_host[slot] + (size_t) l.eg * c.C * lp;
             CK(cudaMemcpyAsync(c.eg_rows, host, (size_t) T * per, cudaMemcpyHostToDevice, s));
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
                 const int ns = std::min(256, T - s0);
-                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, (int) eg_q6k[(size_t) l.eg]);
+                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, efmt);
                 x3::rows_f16(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s);
                 if (!gemm(d, c, l.eg_wkv, c.eg_x16, cols * ehd, ns, c.eg_kv, (H + 1) * D, 0.0f, err)) return false;
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
@@ -14601,7 +14698,8 @@ struct Model::Impl {
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
             for (int e = 0; e < l.n_exp; ++e) {
                 const int v = L0.vs_pin[e];
-                pr[e] += (uint32_t) (b[(size_t) v + 1] - b[(size_t) v]);
+                const int cnt = b[(size_t) v + 1] - b[(size_t) v];
+                pr[e] += (uint32_t) cnt;
             }
             st.experts += (int64_t) T * l.k_exp;
             if (c.flow && wp.k + 1 == (int) c.fl_T.size()) {   // (a run's last chunk: its last rows' picks, warm_after)
@@ -14739,7 +14837,7 @@ struct Model::Impl {
         void start() { worker = std::thread([this] { work(); }); }
         void wake() { cv.notify_all(); }   // halt/eg_abort are set by other threads, not through this prefetcher
         void work() {
-            const size_t per = (size_t) (p->pk.eg_ngram - 1) * p->pk.eg_heads * (p->pk.eg_hd + p->pk.eg_hd / 32);
+            const size_t per = (size_t) (p->pk.eg_ngram - 1) * p->pk.eg_heads * p->eg_stride;   // staging
             size_t zone = std::getenv("DS4_EG_ZONE_KB") ? (size_t) std::max(0, std::atoi(std::getenv("DS4_EG_ZONE_KB"))) << 10 : 0;
             auto publish = [&](size_t u) {
                 {
@@ -14899,7 +14997,7 @@ struct Model::Impl {
             if (L[(size_t) il].eg >= 0)
                 for (int k = 0; k < nk; ++k)
                     if (run.runs(k, il)) egu.push_back({L[(size_t) il].eg, k});
-        const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
+        const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * eg_stride;   // a layer's room
         auto read_eg = [this, &c, &run, &egu, eg_per](size_t u) {
             if (u >= 2) cudaEventSynchronize(c.eg_ev[u % 2]);
             const int li = egu[u].first, k = egu[u].second;
@@ -15056,10 +15154,14 @@ struct Model::Impl {
                 if (!run.runs(k, il) || run.kv_only(k, il)) continue;   // (a long prompt's skip: no experts there)
                 const Layer& L0 = L[(size_t) il];
                 bool here = false;
-                for (int m = 0; m < L0.nm; ++m) here = here || member(L0, m).dev == di;
+                for (int m = 0; m < L0.nm; ++m) {
+                    if (member(L0, m).dev != di) continue;
+                    here = true;
+                }
                 if (!here) continue;
-                for (int j0 = 0; j0 < (int) L0.host_list.size(); j0 += B)
-                    S.b.push_back({k, il, j0, std::min(B, (int) L0.host_list.size() - j0)});
+                const std::vector<int>& hl = L0.host_list;
+                for (int j0 = 0; j0 < (int) hl.size(); j0 += B)
+                    S.b.push_back({k, il, j0, std::min(B, (int) hl.size() - j0)});
             }
         if (!S.b.empty() && c.ring == nullptr) {
             err = "no slots to stream experts into on CUDA" + std::to_string(d.id);
@@ -15083,7 +15185,7 @@ struct Model::Impl {
         for (const Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back(l0.eg);
-        const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
+        const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * eg_stride;   // a layer's room
         // (a group's: its first member reads them for every member - slot k % 2 once each member's copies of chunk
         //  k - 2 out of it are done - and the others wait for its slots)
         const int eg_src = egs.empty() ? di : eg_src_dev(di);
@@ -16221,7 +16323,7 @@ struct Model::Impl {
                                  policy, lm ? "layer-major" : "chunk-major", prefetch->units.size(), chunk,
                                  prefetch->ahead, max_window_tokens(eg_ahead),
                                  window_lookups, eg_cache.capacity(), eg_zone_kb,
-                                 (double) max_window_tokens(eg_ahead) * cols * (pk.eg_hd + pk.eg_hd / 32) / 1048576.0);
+                                 (double) max_window_tokens(eg_ahead) * cols * eg_stride / 1048576.0);
             }
         }
         std::vector<std::string> errs(devs.size());
@@ -17159,17 +17261,25 @@ struct Model::Impl {
         // Engram
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
-            const size_t per = (size_t) cols * (ehd + ehd / 32);
+            const int efmt = eg_q6k[(size_t) l.eg];
+            const size_t per = (size_t) cols * eg_row_bytes(efmt, ehd), lp = (size_t) cols * eg_stride;
             eg_finish(*eg_win[(size_t) l.eg]);   // (asked for when the window began)
-            uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
-            for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
-                CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd,
-                                   cudaMemcpyHostToDevice, s));
-            uint8_t* sc = d.eg_rows + (size_t) T * cols * ehd;
-            for (int t = 0; t < T; ++t)
-                CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
-                                   (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
-            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_q6k[(size_t) l.eg]);
+            uint8_t* src = h_eg + (size_t) l.eg * eg_cap * lp;
+            if (efmt == 3) {   // (whole Q8_0 rows: the device reads them where they lie)
+                for (int t = 0; t < T; ++t)
+                    CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * (ehd / 32 * kQ8_0Bytes), src + (size_t) t * per,
+                                       per, cudaMemcpyHostToDevice, s));
+                engram_dequant(d.eg_rows, nullptr, T * cols, ehd, d.eg_x, s, efmt);
+            } else {
+                for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
+                    CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd,
+                                       cudaMemcpyHostToDevice, s));
+                uint8_t* sc = d.eg_rows + (size_t) T * cols * ehd;
+                for (int t = 0; t < T; ++t)
+                    CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
+                                       (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
+                engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, efmt);
+            }
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }

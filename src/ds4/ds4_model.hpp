@@ -196,7 +196,8 @@ public:
 
     void reset();
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
-    /// restore(limit) goes back to the latest one at or before limit (-1: none).
+    /// slot 2 is the anchor (pin()) and slot 3 the prefix a GEN's pin=N marked.  restore(limit) goes back to the
+    /// latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);
     bool restore(int64_t limit);
     int64_t restorable(int64_t limit) const;

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -71,21 +72,42 @@ float f16_to_f32(uint16_t b) {
     return v;
 }
 
-// an F32 / BF16 / F16 tensor as F32 on the host (+ add to every value)
+float fp8_e4m3_to_f32(uint8_t q) {
+    const int e = (q >> 3) & 15, m = q & 7;
+    float v = e == 0 ? (float) m * 0.001953125f : (e == 15 && m == 7) ? NAN : std::ldexp(1.0f + (float) m * 0.125f, e - 7);
+    return (q & 0x80) ? -v : v;
+}
+
+// an F32 / BF16 / F16 / MXFP8 tensor as F32 on the host (+ add to every value)
 bool host_f32(const Pack& pk, const std::string& name, float add, std::vector<float>& out, std::string& err) {
     const Tensor* t = pk.get(name);
     if (!t) {
         err = "tp: " + name + " missing";
         return false;
     }
-    const size_t es = t->dtype == "F32" ? 4 : 2;
+    const bool fp8 = t->dtype == "F8_E4M3";
+    const size_t es = t->dtype == "F32" ? 4 : fp8 ? 1 : 2;
     const size_t n = t->bytes / es;
     out.resize(n);
     const uint8_t* d = pk.data(*t);
+    const Tensor* scale = nullptr;
+    if (fp8) {
+        scale = pk.get(name + "_scale_inv");
+        if (scale == nullptr || scale->dtype != "U8" || scale->bytes * 32 != t->bytes) {
+            err = "tp: " + name + ": FP8 weights need their MXFP8 U8 scales";
+            return false;
+        }
+    } else if (t->dtype != "F32" && t->dtype != "BF16" && t->dtype != "F16") {
+        err = "tp: " + name + ": dtype " + t->dtype;
+        return false;
+    }
+    const uint8_t* sc = fp8 ? pk.data(*scale) : nullptr;
     for (size_t i = 0; i < n; ++i) {
         float v;
         if (t->dtype == "F32") {
             std::memcpy(&v, d + 4 * i, 4);
+        } else if (fp8) {
+            v = std::ldexp(fp8_e4m3_to_f32(d[i]), (int) sc[i / 32] - 127);
         } else {
             uint16_t b;
             std::memcpy(&b, d + 2 * i, 2);
@@ -253,13 +275,15 @@ struct TpEngine::Impl {
         int n_slots = 0;
         size_t slot_bytes = 0;
         std::vector<uint8_t*> slot_base;                  // [member]
+        std::vector<unsigned long long*> slot_eptr;       // [member][slot]: stable device addresses for mixed SetArgs
+        std::vector<int> slot_class;                      // each slot holds only this expert signature
         std::vector<cudaStream_t> cs;                     // [member]
         std::vector<std::vector<cudaEvent_t>> slot_ev;    // [member][slot]
         std::vector<long long> slot_owner, slot_pend, slot_iss, slot_used;
         int n_pending = 0;
         std::vector<std::pair<int, long long>> promo_q;   // (slot, key) to copy after the window
-        // the decode's promotions hold at most prom_cap slots (slot_prom): the rest stay free for a prompt's staged
-        // experts, which take no promoted slot while another is free - a prompt leaves the decode's cache as it was
+        // Decode may use every slot. A subsequent prompt reclaims promoted slots in plan_prompt's second pass,
+        // clearing the old expert's slot_of mapping before staging its replacement.
         std::vector<char> slot_prom;
         int n_prom = 0, prom_cap = 0;
         std::vector<cudaEvent_t> p_ev;   // [member] a prompt layer's staged copies done (on cs)
@@ -272,6 +296,7 @@ struct TpEngine::Impl {
         k::KvQ kvq;   // (--kv-cache: K's / V's quantized caches - a format other than BF16 instead of kc / vc)
         k::KvHost kvh;   // (--kv-streaming: the caches above a ring, every position in host memory too)
         uint8_t* res_base = nullptr;
+        unsigned long long* res_eptr = nullptr;           // [resident slot]: stable device addresses for mixed SetArgs
         float* gate = nullptr;   // (member 0: the router, F32 [n_exp][dim])
         // (#556) this member's own slices of more experts outside the group's VRAM set (place_extra): expert -> its
         // slot in xres_base (-1: none; empty: none at all)
@@ -286,14 +311,58 @@ struct TpEngine::Impl {
         x3::ExpertLayout lay;
         size_t blob = 0;                          // a member's slice of an expert
         std::vector<std::array<Ex3, 3>> ex;       // the experts' w1, w3, w2 in the files
+        std::vector<x3::ExpertLayout> expert_lay; // each expert's own member-slice layout
+        std::vector<size_t> expert_bytes;         // actual member-slice bytes; host storage does not pad to layer max
+        std::vector<int> expert_class;            // the three k2 values, encoded by signature()
+        std::map<int, x3::ExpertLayout> class_lay;
+        bool mixed = false;
         std::vector<int> res_slot, res_ids;
-        std::vector<const uint8_t*> host;         // expert -> its tp slices in the pinned pool (blob apart)
+        std::vector<const uint8_t*> host;         // expert -> its packed tp slices, expert_bytes[e] apart
         std::vector<int> slot_of;                 // expert -> its slot in the group's cache (-1: none)
     };
     // member j's own slice of expert x of layer l (Slice::xres): its slot, or -1
     static int xres_of(const Layer& l, int j, int x) {
         const std::vector<int>& v = l.sl[(size_t) j].xres_slot;
         return v.empty() ? -1 : v[(size_t) x];
+    }
+
+    static int signature(const x3::ExpertLayout& lay) {
+        return ((lay.k2[0] / 2 - 1) * 4 + (lay.k2[1] / 2 - 1)) * 4 + (lay.k2[2] / 2 - 1);
+    }
+
+    x3::MixedLayouts mixed_layouts(const Layer& l, int j) const {
+        x3::MixedLayouts mx{};
+        const Group& gr = G[(size_t) l.group];
+        const Slice& S = l.sl[(size_t) j];
+        const auto add = [&](int code, unsigned long long lo, unsigned long long hi) {
+            if (lo == hi || mx.n >= x3::kMaxClasses) return;
+            const int c = mx.n++;
+            mx.lo[c] = lo;
+            mx.hi[c] = hi;
+            mx.lay[c] = l.class_lay.at(code);
+        };
+        for (const auto& [code, lay] : l.class_lay) {
+            (void) lay;
+            int first = -1, end = -1;
+            for (size_t s = 0; s < l.res_ids.size(); ++s) {
+                if (l.expert_class[(size_t) l.res_ids[s]] != code) continue;
+                if (first < 0) first = (int) s;
+                end = (int) s + 1;
+            }
+            if (first >= 0)
+                add(code, (unsigned long long) (S.res_base + (size_t) first * l.blob),
+                    (unsigned long long) (S.res_base + (size_t) end * l.blob));
+            first = end = -1;
+            for (size_t s = 0; s < gr.slot_class.size(); ++s) {
+                if (gr.slot_class[s] != code) continue;
+                if (first < 0) first = (int) s;
+                end = (int) s + 1;
+            }
+            if (first >= 0)
+                add(code, (unsigned long long) (gr.slot_base[(size_t) j] + (size_t) first * gr.slot_bytes),
+                    (unsigned long long) (gr.slot_base[(size_t) j] + (size_t) end * gr.slot_bytes));
+        }
+        return mx;
     }
 
     std::vector<Member> M;
@@ -311,6 +380,7 @@ struct TpEngine::Impl {
     std::map<int, std::array<size_t, kAN>> acct;
     std::map<int, size_t> acct_ic, acct_kvh;   // (the index-key caches, every member's whole; the host KV bytes)
     uint8_t* pool = nullptr;
+    bool pool_pinned = false;
     size_t plan_bytes = 0;
     std::vector<float> inv_freq;
     // the head
@@ -376,7 +446,10 @@ struct TpEngine::Impl {
                 if (gr.cs[j]) cudaStreamDestroy(gr.cs[j]);
             }
         for (void* x : hosted) cudaFreeHost(x);
-        if (pool) cudaFreeHost(pool);
+        if (pool) {
+            if (pool_pinned) cudaFreeHost(pool);
+            else std::free(pool);
+        }
         for (Member& m : M) {
             cudaSetDevice(m.id);
             if (m.blas) cublasDestroy(m.blas);
@@ -458,12 +531,14 @@ struct TpEngine::Impl {
         return true;
     }
 
-    // expert e of layer l, member m's slice (of tm) -> dst (l.lay)
+    // expert e of layer l, member m's slice (of tm) -> dst, using only this expert's own layout bytes
     void assemble(const Layer& l, int e, int m, int tm, uint8_t* dst) const {
         const int f0 = m * (g.ff / tm), f1 = f0 + g.ff / tm;
+        const x3::ExpertLayout& lay = l.expert_lay[(size_t) e];
+        std::memset(dst, 0, l.expert_bytes[(size_t) e]);
         for (int r = 0; r < 3; ++r) {
             const Ex3& x = l.ex[(size_t) e][(size_t) r];
-            cut(x, r < 2 ? 'n' : 'k', f0, f1, dst + l.lay.trellis[r], dst + l.lay.suh[r], dst + l.lay.svh[r]);
+            cut(x, r < 2 ? 'n' : 'k', f0, f1, dst + lay.trellis[r], dst + lay.suh[r], dst + lay.svh[r]);
         }
     }
 
@@ -488,7 +563,7 @@ struct TpEngine::Impl {
             std::vector<C> c;
             for (int li = gr.l0; li < gr.l1; ++li) {
                 const Layer& l = L[(size_t) li];
-                if (!l.moe || l.host.empty() || l.res_slot.empty()) continue;
+                if (!l.moe || l.mixed || l.host.empty() || l.res_slot.empty()) continue;
                 for (int e = 0; e < g.n_exp; ++e)
                     if (l.res_slot[(size_t) e] < 0 && l.host[(size_t) e] != nullptr)
                         c.push_back({prof.empty() ? 0u : prof[(size_t) li * g.n_exp + e], li, e});
@@ -525,8 +600,9 @@ struct TpEngine::Impl {
                     }
                     bool ok = true;
                     for (size_t s = 0; s < v.size() && ok; ++s)
-                        ok = cudaMemcpy(S.xres_base + s * l.blob, l.host[(size_t) v[s]] + (size_t) j * l.blob, l.blob,
-                                        cudaMemcpyHostToDevice) == cudaSuccess;
+                        ok = cudaMemcpy(S.xres_base + s * l.blob,
+                                        l.host[(size_t) v[s]] + (size_t) j * l.expert_bytes[(size_t) v[s]],
+                                        l.expert_bytes[(size_t) v[s]], cudaMemcpyHostToDevice) == cudaSuccess;
                     if (!ok) {   // (never a slot whose copy did not land)
                         cudaGetLastError();
                         continue;
@@ -846,30 +922,47 @@ struct TpEngine::Impl {
                     for (int r = 0; r < 3; ++r)
                         if (!ex3(pk, Mo + "experts." + std::to_string(e) + "." + parts[r], l.ex[(size_t) e][(size_t) r], err))
                             return false;
-                size_t off = 0;
-                for (int r = 0; r < 3; ++r) {
-                    const Ex3& x = l.ex[0][(size_t) r];
-                    const char by = r < 2 ? 'n' : 'k';
-                    l.lay.trellis[r] = off;
-                    off += up(tr_bytes(x, by, 0, mfs));
-                    l.lay.suh[r] = off;
-                    off += up(suh_bytes(x, by, 0, mfs));
-                    l.lay.svh[r] = off;
-                    off += up(svh_bytes(x, by, 0, mfs));
-                    l.lay.k2[r] = x.k2;
-                }
-                l.lay.cb = 2;
-                l.blob = off;
-                if (l.lay.k2[0] != l.lay.k2[1]) {
-                    err = "tp: layer " + std::to_string(li) + ": gate and up at different bits";
-                    return false;
-                }
-                for (int e = 1; e < g.n_exp; ++e)
-                    for (int r = 0; r < 3; ++r)
-                        if (l.ex[(size_t) e][(size_t) r].k2 != l.lay.k2[r] || l.ex[(size_t) e][(size_t) r].K != l.ex[0][(size_t) r].K) {
-                            err = "tp: layer " + std::to_string(li) + ": experts of different shapes or bits";
+                l.expert_lay.resize((size_t) g.n_exp);
+                l.expert_bytes.resize((size_t) g.n_exp);
+                l.expert_class.resize((size_t) g.n_exp);
+                for (int e = 0; e < g.n_exp; ++e) {
+                    x3::ExpertLayout lay{};
+                    size_t off = 0;
+                    for (int r = 0; r < 3; ++r) {
+                        const Ex3& x = l.ex[(size_t) e][(size_t) r];
+                        const Ex3& x0 = l.ex[0][(size_t) r];
+                        if (x.K != x0.K || x.N != x0.N) {
+                            err = "tp: layer " + std::to_string(li) + ": experts have different matrix shapes";
                             return false;
                         }
+                        const char by = r < 2 ? 'n' : 'k';
+                        lay.trellis[r] = off;
+                        off += up(tr_bytes(x, by, 0, mfs));
+                        lay.suh[r] = off;
+                        off += up(suh_bytes(x, by, 0, mfs));
+                        lay.svh[r] = off;
+                        off += up(svh_bytes(x, by, 0, mfs));
+                        lay.k2[r] = x.k2;
+                    }
+                    lay.cb = 2;
+                    if (!x3::mixed_supported(lay)) {
+                        err = "tp: layer " + std::to_string(li) + " expert " + std::to_string(e) +
+                              ": EXL3 bitrate or codebook is not covered by the mixed kernels";
+                        return false;
+                    }
+                    const int code = signature(lay);
+                    l.expert_lay[(size_t) e] = lay;
+                    l.expert_bytes[(size_t) e] = off;
+                    l.expert_class[(size_t) e] = code;
+                    l.class_lay.emplace(code, lay);
+                    l.blob = std::max(l.blob, off);
+                }
+                if (l.class_lay.size() * 2 > x3::kMaxClasses) {
+                    err = "tp: layer " + std::to_string(li) + " has too many EXL3 expert classes";
+                    return false;
+                }
+                l.lay = l.expert_lay[0];
+                l.mixed = l.class_lay.size() > 1 || l.lay.k2[0] != l.lay.k2[1];
             }
             l.sl.resize((size_t) t);
             for (int j = 0; j < t; ++j) {
@@ -1018,6 +1111,28 @@ struct TpEngine::Impl {
                                    std::to_string(asked) + "): the GPU memory is tight, a prompt stages a layer's "
                                    "experts outside VRAM at once");
                 gr.n_slots = S;
+                std::map<int, size_t> class_weight;
+                for (int li : ml)
+                    for (int e = 0; e < g.n_exp; ++e)
+                        ++class_weight[L[(size_t) li].expert_class[(size_t) e]];
+                std::vector<std::pair<int, size_t>> classes(class_weight.begin(), class_weight.end());
+                std::stable_sort(classes.begin(), classes.end(), [](const auto& a, const auto& b) {
+                    return a.second > b.second;
+                });
+                std::map<int, int> class_slots;
+                for (int s = 0; s < std::min<int>(S, (int) classes.size()); ++s) ++class_slots[classes[(size_t) s].first];
+                for (int s = (int) class_slots.size(); s < S && !classes.empty(); ++s) {
+                    int best = classes[0].first;
+                    double load = (double) class_slots[best] / (double) classes[0].second;
+                    for (const auto& [code, weight] : classes) {
+                        const double q = (double) class_slots[code] / (double) weight;
+                        if (q < load) { best = code; load = q; }
+                    }
+                    ++class_slots[best];
+                }
+                gr.slot_class.clear();
+                for (const auto& [code, count] : class_slots)
+                    for (int s = 0; s < count; ++s) gr.slot_class.push_back(code);
                 floor_res = g.n_exp - S;
                 budget -= (size_t) S * blob_max;
             }
@@ -1059,7 +1174,10 @@ struct TpEngine::Impl {
             for (int li : ml) {
                 Layer& l = L[(size_t) li];
                 std::vector<int>& v = chosen[li];
-                std::sort(v.begin(), v.end());
+                std::sort(v.begin(), v.end(), [&](int a, int b) {
+                    const int ca = l.expert_class[(size_t) a], cb = l.expert_class[(size_t) b];
+                    return ca == cb ? a < b : ca < cb;
+                });
                 l.res_slot.assign((size_t) g.n_exp, -1);
                 l.res_ids = v;
                 for (size_t s = 0; s < v.size(); ++s) l.res_slot[(size_t) v[s]] = (int) s;
@@ -1067,7 +1185,14 @@ struct TpEngine::Impl {
                 st.vram_gb += (double) (v.size() * l.blob * gr.mem.size()) / (1u << 30);
                 for (size_t j = 0; j < gr.mem.size(); ++j) {
                     Member& m = M[(size_t) gr.mem[j]];
-                    if (!v.empty() && !dalloc(m.id, l.sl[j].res_base, v.size() * l.blob, err)) return false;
+                    if (!v.empty()) {
+                        if (!dalloc(m.id, l.sl[j].res_base, v.size() * l.blob, err) ||
+                            !dalloc(m.id, l.sl[j].res_eptr, v.size(), err)) return false;
+                        std::vector<unsigned long long> ptr(v.size());
+                        for (size_t s = 0; s < v.size(); ++s)
+                            ptr[s] = (unsigned long long) (l.sl[j].res_base + s * l.blob);
+                        TK(cudaMemcpy(l.sl[j].res_eptr, ptr.data(), ptr.size() * sizeof(ptr[0]), cudaMemcpyHostToDevice));
+                    }
                 }
             }
         }
@@ -1099,7 +1224,8 @@ struct TpEngine::Impl {
                                 const int b = k & 1;
                                 cudaEventSynchronize(ev[b]);
                                 assemble(l, l.res_ids[s], (int) j, (int) G[gi].mem.size(), pin[b]);
-                                cudaMemcpyAsync(l.sl[j].res_base + s * l.blob, pin[b], l.blob, cudaMemcpyHostToDevice, m.s);
+                                cudaMemcpyAsync(l.sl[j].res_base + s * l.blob, pin[b],
+                                                l.expert_bytes[(size_t) l.res_ids[s]], cudaMemcpyHostToDevice, m.s);
                                 cudaEventRecord(ev[b], m.s);
                             }
                         }
@@ -1120,12 +1246,18 @@ struct TpEngine::Impl {
             const int t = (int) gr.mem.size();
             if (gr.slot_bytes == 0 || gr.n_slots == 0) continue;
             gr.slot_base.assign((size_t) t, nullptr);
+            gr.slot_eptr.assign((size_t) t, nullptr);
             gr.cs.assign((size_t) t, nullptr);
             gr.slot_ev.assign((size_t) t, {});
             acat = kAPool;
             for (int j = 0; j < t; ++j) {
                 Member& m = M[(size_t) gr.mem[(size_t) j]];
-                if (!dalloc(m.id, gr.slot_base[(size_t) j], (size_t) gr.n_slots * gr.slot_bytes, err)) return false;
+                if (!dalloc(m.id, gr.slot_base[(size_t) j], (size_t) gr.n_slots * gr.slot_bytes, err) ||
+                    !dalloc(m.id, gr.slot_eptr[(size_t) j], (size_t) gr.n_slots, err)) return false;
+                std::vector<unsigned long long> ptr((size_t) gr.n_slots);
+                for (int s = 0; s < gr.n_slots; ++s)
+                    ptr[(size_t) s] = (unsigned long long) (gr.slot_base[(size_t) j] + (size_t) s * gr.slot_bytes);
+                TK(cudaMemcpy(gr.slot_eptr[(size_t) j], ptr.data(), ptr.size() * sizeof(ptr[0]), cudaMemcpyHostToDevice));
                 TK(cudaStreamCreateWithFlags(&gr.cs[(size_t) j], cudaStreamNonBlocking));
                 gr.slot_ev[(size_t) j].resize((size_t) gr.n_slots);
                 for (auto& e : gr.slot_ev[(size_t) j]) TK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -1135,12 +1267,9 @@ struct TpEngine::Impl {
                 TK(cudaSetDevice(M[(size_t) gr.mem[(size_t) j]].id));
                 TK(cudaEventCreateWithFlags(&gr.p_ev[(size_t) j], cudaEventDisableTiming));
             }
-            // (the promotions' cap: a layer's experts outside VRAM, the most of the group's, stay free for prompts)
-            int reserve = 0;
-            for (int li = gr.l0; li < gr.l1; ++li)
-                if (L[(size_t) li].moe) reserve = std::max(reserve, g.n_exp - (int) L[(size_t) li].res_ids.size());
+            // No prompt is in flight during decode; plan_prompt already preempts promoted slots when needed.
             gr.slot_prom.assign((size_t) gr.n_slots, 0);
-            gr.prom_cap = std::max(0, gr.n_slots - reserve);
+            gr.prom_cap = gr.n_slots;
             gr.slot_owner.assign((size_t) gr.n_slots, -1);
             gr.slot_pend.assign((size_t) gr.n_slots, -1);
             gr.slot_iss.assign((size_t) gr.n_slots, 0);
@@ -1153,13 +1282,31 @@ struct TpEngine::Impl {
         {
             size_t total = 0;
             for (const Layer& l : L)
-                if (l.moe) total += (size_t) (g.n_exp - (int) l.res_ids.size()) * l.blob * G[(size_t) l.group].mem.size();
+                if (l.moe)
+                    for (int e = 0; e < g.n_exp; ++e)
+                        if (l.res_slot[(size_t) e] < 0)
+                            total += l.expert_bytes[(size_t) e] * G[(size_t) l.group].mem.size();
             if (total > 0) {
                 TK(cudaSetDevice(M[0].id));
-                if (cudaHostAlloc((void**) &pool, total, cudaHostAllocPortable) != cudaSuccess) {
-                    pool = nullptr;
-                    err = "tp: the pinned pool (" + std::to_string(total >> 30) + " GB) not allocated";
-                    return false;
+                const double total_ram = (double) os::ram_total(), available_ram = (double) os::ram_avail();
+                const size_t pin_head = total_ram > 0
+                    ? (size_t) std::min(16.0, std::max(4.0, total_ram / 10.0 / (1u << 30))) * (1u << 30)
+                    : (size_t) 8 << 30;
+                const bool pin_fits = available_ram <= 0 || (double) total + (double) pin_head <= available_ram;
+                if (pin_fits && cudaHostAlloc((void**) &pool, total, cudaHostAllocPortable) == cudaSuccess) {
+                    pool_pinned = true;
+                } else {
+                    cudaGetLastError();
+                    pool = (uint8_t*) std::malloc(total);
+                    if (pool == nullptr) {
+                        err = "tp: the " + std::to_string(total >> 30) + " GB expert host pool was not allocated "
+                              "(page-locked and pageable RAM both failed)";
+                        return false;
+                    }
+                    info.push_back("NOTE: tp: the " + std::to_string(total >> 30) +
+                                   " GB expert pool could not be page-locked with the available RAM / CUDA mapping; "
+                                   "using pageable RAM, which can slow expert staging and may use the SSD under memory "
+                                   "pressure");
                 }
                 std::vector<std::pair<int, int>> todo;
                 size_t off = 0;
@@ -1170,7 +1317,7 @@ struct TpEngine::Impl {
                     for (int e = 0; e < g.n_exp; ++e)
                         if (l.res_slot[(size_t) e] < 0) {
                             l.host[(size_t) e] = pool + off;
-                            off += l.blob * G[(size_t) l.group].mem.size();
+                            off += l.expert_bytes[(size_t) e] * G[(size_t) l.group].mem.size();
                             todo.push_back({li, e});
                         }
                 }
@@ -1184,11 +1331,12 @@ struct TpEngine::Impl {
                             const int e = todo[i].second;
                             const int tm = (int) G[(size_t) l.group].mem.size();
                             for (int j = 0; j < tm; ++j)
-                                assemble(l, e, j, tm, (uint8_t*) l.host[(size_t) e] + (size_t) j * l.blob);
+                                assemble(l, e, j, tm,
+                                         (uint8_t*) l.host[(size_t) e] + (size_t) j * l.expert_bytes[(size_t) e]);
                         }
                     });
                 for (auto& x : th) x.join();
-                st.pinned_gb = (double) total / (1u << 30);
+                st.pinned_gb = pool_pinned ? (double) total / (1u << 30) : 0.0;
                 st.pooled = (long) todo.size();
             }
         }
@@ -1350,11 +1498,11 @@ struct TpEngine::Impl {
         lent_g = -1;
     }
 
-    bool refresh(Group& gr, std::string& err) {
+    bool refresh(Group& gr, std::string& err, bool drain = false) {
         if (gr.n_pending == 0) return true;
         for (int s = 0; s < gr.n_slots; ++s) {
             const long long key = gr.slot_pend[(size_t) s];
-            if (key < 0 || fwd - gr.slot_iss[(size_t) s] < o.promote_lag) continue;
+            if (key < 0 || (!drain && fwd - gr.slot_iss[(size_t) s] < o.promote_lag)) continue;
             for (size_t j = 0; j < gr.mem.size(); ++j) {
                 TK(cudaSetDevice(M[(size_t) gr.mem[j]].id));
                 TK(cudaEventSynchronize(gr.slot_ev[j][(size_t) s]));
@@ -1378,7 +1526,8 @@ struct TpEngine::Impl {
         float bs = sc;
         const bool full = gr.n_prom >= gr.prom_cap;   // (then a promotion takes a promoted slot)
         for (int s = 0; s < gr.n_slots; ++s) {
-            if (gr.slot_pend[(size_t) s] >= 0 || gr.slot_used[(size_t) s] == fwd) continue;
+            if (gr.slot_class[(size_t) s] != L[(size_t) li].expert_class[(size_t) e] ||
+                gr.slot_pend[(size_t) s] >= 0 || gr.slot_used[(size_t) s] == fwd) continue;
             if (full && !gr.slot_prom[(size_t) s]) continue;
             const long long ok = gr.slot_owner[(size_t) s];
             const float os = ok < 0 ? -1.0f : score(ok, false);
@@ -1406,9 +1555,10 @@ struct TpEngine::Impl {
         for (const auto& [s, key] : gr.promo_q) {
             const Layer& l = L[(size_t) (key / 1024)];
             const uint8_t* src = l.host[(size_t) (key % 1024)];
+            const size_t bytes = l.expert_bytes[(size_t) (key % 1024)];
             for (size_t j = 0; j < gr.mem.size(); ++j) {
                 TK(cudaSetDevice(M[(size_t) gr.mem[j]].id));
-                TK(cudaMemcpyAsync(gr.slot_base[j] + (size_t) s * gr.slot_bytes, src + j * l.blob, l.blob,
+                TK(cudaMemcpyAsync(gr.slot_base[j] + (size_t) s * gr.slot_bytes, src + j * bytes, bytes,
                                    cudaMemcpyHostToDevice, gr.cs[j]));
                 TK(cudaEventRecord(gr.slot_ev[j][(size_t) s], gr.cs[j]));
             }
@@ -1599,7 +1749,8 @@ struct TpEngine::Impl {
                 for (int q = 0; q < hd.n_copy; ++q) {
                     const int sl = pp.cslot[q], e = pp.cexp[q];
                     TK(cudaMemcpyAsync(gr.slot_base[(size_t) j] + (size_t) sl * gr.slot_bytes,
-                                       l.host[(size_t) e] + (size_t) j * l.blob, l.blob, cudaMemcpyHostToDevice, cs));
+                                       l.host[(size_t) e] + (size_t) j * l.expert_bytes[(size_t) e],
+                                       l.expert_bytes[(size_t) e], cudaMemcpyHostToDevice, cs));
                 }
                 if (hd.n_copy > 0) TK(cudaEventRecord(gr.p_ev[(size_t) j], cs));
                 TK(cudaMemcpyAsync(m.p_rowidx, pp.rowidx, (size_t) rows * 4, cudaMemcpyHostToDevice, m.s));
@@ -1609,6 +1760,7 @@ struct TpEngine::Impl {
                 TK(cudaMemcpyAsync(m.p_bstg, pp.bstg, (size_t) hd.n_slices * 4097 * 4, cudaMemcpyHostToDevice, m.s));
                 x3::SetArgs sa;
                 sa.lay = l.lay;
+                if (l.mixed) sa.mix = mixed_layouts(l, j);
                 sa.n_embd = g.dim;
                 sa.n_ff = mfs;
                 sa.limit = g.limit;
@@ -1619,6 +1771,7 @@ struct TpEngine::Impl {
                     if (sp.rows_res > 0) {
                         sa.wbase = l.sl[(size_t) j].res_base;
                         sa.stride = l.blob;
+                        sa.eptr = l.mixed ? l.sl[(size_t) j].res_eptr : nullptr;
                         sa.n_exp = sp.n_res;
                         sa.bounds = m.p_bres + (size_t) q * (g.n_exp + 1);
                         sa.row0 = 0;
@@ -1630,6 +1783,7 @@ struct TpEngine::Impl {
                     if (sp.max_stg > 0) {
                         sa.wbase = gr.slot_base[(size_t) j];
                         sa.stride = gr.slot_bytes;
+                        sa.eptr = l.mixed ? gr.slot_eptr[(size_t) j] : nullptr;
                         sa.n_exp = sp.n_stg;
                         sa.bounds = m.p_bstg + (size_t) q * 4097;
                         sa.row0 = sp.rows_res;
@@ -1698,7 +1852,8 @@ struct TpEngine::Impl {
             if (sl < 0) {
                 for (int pass = 0; pass < 2 && sl < 0; ++pass)   // (a promotion's slot only when no other is free)
                     for (int c = 0; c < gr.n_slots; ++c)
-                        if (gr.slot_pend[(size_t) c] < 0 && slot_exp[(size_t) c] < 0 && (pass || !gr.slot_prom[(size_t) c]) &&
+                        if (gr.slot_class[(size_t) c] == l.expert_class[(size_t) e] &&
+                            gr.slot_pend[(size_t) c] < 0 && slot_exp[(size_t) c] < 0 && (pass || !gr.slot_prom[(size_t) c]) &&
                             (sl < 0 || gr.slot_used[(size_t) c] < gr.slot_used[(size_t) sl]))
                             sl = c;
                 if (sl < 0) {   // (every slot this layer's or pending: the CPU lane takes it)
@@ -1802,15 +1957,16 @@ struct TpEngine::Impl {
                 const int n = (int) std::min(all.size() - u0, (size_t) per);
                 if (ents + n * tm > lane->max_entries()) run();
                 for (int j = 0; j < tm; ++j) {
-                    const uint8_t* b = l.host[(size_t) e] + (size_t) j * l.blob;
+                    const uint8_t* b = l.host[(size_t) e] + (size_t) j * l.expert_bytes[(size_t) e];
+                    const x3::ExpertLayout& lay = l.expert_lay[(size_t) e];
                     CpuExpert c;
                     for (int r = 0; r < 3; ++r) {
-                        c.p[r].trellis = (const uint32_t*) (b + l.lay.trellis[r]);
-                        c.p[r].suh = (const uint16_t*) (b + l.lay.suh[r]);
-                        c.p[r].svh = (const uint16_t*) (b + l.lay.svh[r]);
+                        c.p[r].trellis = (const uint32_t*) (b + lay.trellis[r]);
+                        c.p[r].suh = (const uint16_t*) (b + lay.suh[r]);
+                        c.p[r].svh = (const uint16_t*) (b + lay.svh[r]);
                         c.p[r].k = r < 2 ? g.dim : g.ff / tm;
                         c.p[r].n = r < 2 ? g.ff / tm : g.dim;
-                        c.p[r].k2 = l.lay.k2[r];
+                        c.p[r].k2 = lay.k2[r];
                     }
                     c.w = 1.0f;
                     ex.push_back(c);
@@ -1995,6 +2151,10 @@ struct TpEngine::Impl {
                 err = "token id " + std::to_string(ids[t]) + " outside the vocabulary";
                 return false;
             }
+        // A prompt must be able to evict every slot. Finish the last decode's pending copies even when their
+        // normal decode lag has not elapsed, otherwise those slots stay unavailable for the entire prompt.
+        for (Group& gr : G)
+            if (!refresh(gr, err, true)) return false;
         // the chunks: of `chunk` tokens, the last holding every wanted row
         std::vector<PChunk> cks;
         for (int a = 0; a < n; a += chunk) cks.push_back({a, std::min(chunk, n - a), 0});
@@ -2232,6 +2392,7 @@ struct TpEngine::Impl {
                 a.out = m.out;
                 a.out_stride = (size_t) g.dim;
                 a.lay = l.lay;
+                if (l.mixed) a.mix = mixed_layouts(l, j);
                 a.T = T;
                 a.k = g.k_exp;
                 a.n_embd = g.dim;
@@ -2662,15 +2823,16 @@ struct TpEngine::Impl {
                             for (int j = 0; j < tm; ++j) {
                                 if (xres_of(l, j, x) >= 0) continue;
                                 cpu_of[(size_t) x * tm + j] = (int) cpu.size();
-                                const uint8_t* b = l.host[(size_t) x] + (size_t) j * l.blob;
+                                const uint8_t* b = l.host[(size_t) x] + (size_t) j * l.expert_bytes[(size_t) x];
+                                const x3::ExpertLayout& lay = l.expert_lay[(size_t) x];
                                 CpuExpert c;
                                 for (int r = 0; r < 3; ++r) {
-                                    c.p[r].trellis = (const uint32_t*) (b + l.lay.trellis[r]);
-                                    c.p[r].suh = (const uint16_t*) (b + l.lay.suh[r]);
-                                    c.p[r].svh = (const uint16_t*) (b + l.lay.svh[r]);
+                                    c.p[r].trellis = (const uint32_t*) (b + lay.trellis[r]);
+                                    c.p[r].suh = (const uint16_t*) (b + lay.suh[r]);
+                                    c.p[r].svh = (const uint16_t*) (b + lay.svh[r]);
                                     c.p[r].k = r < 2 ? g.dim : g.ff / tm;
                                     c.p[r].n = r < 2 ? g.ff / tm : g.dim;
-                                    c.p[r].k2 = l.lay.k2[r];
+                                    c.p[r].k2 = lay.k2[r];
                                 }
                                 c.w = 1.0f;
                                 cpu.push_back(c);

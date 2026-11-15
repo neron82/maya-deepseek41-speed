@@ -76,6 +76,10 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
 | LibertAIDAI's [EXL3 3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) + the same Engram tables (`--ds4-quant exl3-3.5`: closer to the original, ~280 GB of VRAM + RAM) | 461 GB | the same |
 | orcarouter's [Abliterated GGUFs](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF), the model with its refusals removed: Mix-128G (`--ds4-quant abliterated-128g`, ~114 GB of VRAM + RAM) or Mix-256G (`abliterated-256g`, ~236 GB); `abliterated` picks the one your PC holds. Their n-gram table is left out and Maya's Q6_K tables are read instead (once for both). A gated repo: accept its terms, then `HF_TOKEN` or `hf auth login` | 275 / 397 GB, with the 161 GB of n-gram tables shared with Maya's DeepSeek quants (downloaded once) | NVIDIA from Volta (V100) on (AMD not tried yet) |
 
+ISTA-DASLab's GSQ-RCO GGUF sets use the existing IQ1_M / IQ2_XXS / IQ2_XS expert kernels; no alternate GSQ
+dequantization is needed. Their Q8_0 Engram tables are read with each ggml block's own scale.
+`tools/ds4/pack_gguf.py` finds the Dense-Engram companion shards beside the main model shards.
+
 - **Any amount of memory:** the most-used experts go to the GPUs, the others are read in place from the model's files -
   from RAM where they fit, from the SSD otherwise. More VRAM and RAM is faster; keep the files on an NVMe SSD. The
   setup recommends a 256K context where your VRAM and RAM hold the model, 64K otherwise.
@@ -84,7 +88,9 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
   only where it does.
 - **Pictures:** with the GGUFs the setup fetches DeepSeek's vision tower (1 GB of its checkpoint). It waits in RAM
   and takes no VRAM between pictures: while a picture is read it borrows about 320 MB of the first GPU's memory, then
-  gives it back to the model. `--no-vision` leaves it out.
+  gives it back to the model. `--no-vision` leaves it out. A pack that stores the tower in F16 or F32 (ISTA-DASLab's
+  GSQ-RCO vision GGUFs) is converted nearest-even to the BF16 format the tower computes in. Existing BF16 packs are
+  read unchanged.
 - **One GPU or several:** the layers are split across the GPUs (pairs of equal GPUs also split each layer where the
   files' formats allow), its thinking levels (Off, Low, High, Max) in the chat, and its own numbers in the monitor.
 - **Strix Halo / Gorgon Halo on Windows:** Windows counts the GPU's share of the memory against its page file, so the
@@ -106,6 +112,11 @@ All of these are optional; the details and every setting are in [SETTINGS.md](SE
   new tokens: in RAM, or across a restart from the folder. Off by default. How many are kept in RAM, the folder, its
   size cap and how long a slot lives are settings too
   ([conversations kept](SETTINGS.md#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)).
+- **Shared start:** a DeepSeek request that begins with a system message pins its system prompt and tools
+  (`pin=N`) at a fourth checkpoint, so an agent and its sub-agents behind the same start read it once and the next
+  one goes back to it; a client can name its own shared document with
+  `"strata_prefix": {"messages": K}` / `{"message": I, "chars": N}` / `{"tokens": N}`. `MAYA_DS4_AUTO_PIN=0` turns the
+  automatic start off ([the field](SETTINGS.md#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)).
 - **Loading the experts:** the engine reads the pack's expert regions into VRAM and RAM at start. Once a region's
   bytes are copied, the load drops its pages from the file cache (`posix_fadvise`), so the same bytes are not held
   twice and a pack whose copies would not fit beside their cache loads at the disk's speed

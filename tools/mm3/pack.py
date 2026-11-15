@@ -6,7 +6,7 @@ writes <model>/maya-mm3/:
   mm3.txt       the geometry, `key value` lines (lists comma-separated), from config.json's text_config (its
                 sparse_attention_config flattened to sparse_attention_config.<key>), the DSpark draft's config as
                 dspark.<key> (dflash_config.<key> as dspark.dflash.<key>), the special token ids the engine needs and
-                the per-layer EXL3 bits of the experts (exl3.<layer>.w1 / w3 / w2)
+                the maximum EXL3 bits per MoE matrix role and layer (exl3.<layer>.w1 / w3 / w2)
   tensors.txt   every tensor of the model's safetensors and of dspark/'s: `file <i> <path>` lines (paths relative to
                 the model directory), then `t <name> <dtype> <file> <offset> <bytes> <dims...>` - the draft's names
                 prefixed `dspark.`
@@ -15,7 +15,7 @@ writes <model>/maya-mm3/:
                 quant, whichever template its files carry)
 
 The pack stops on anything the engine does not cover: an EXL3 matrix whose codebook is not mul1 or whose bits are
-not whole, experts of one layer at different bits for the same matrix, an index-value branch, init blocks.
+not whole / supported, an index-value branch, init blocks.
 The norm weights stay as stored (Gemma's weight + 1 is the engine's, at load).
 """
 from __future__ import annotations
@@ -93,7 +93,7 @@ def check_exl3(st: SafeTensors) -> tuple[int, list[str]]:
 
 
 def expert_bits(st: SafeTensors, t: dict) -> tuple[dict, list[str]]:
-    """{layer: {w1: K, w3: K, w2: K}} for the MoE layers; a layer whose experts differ for one matrix is a problem."""
+    """{layer: {w1: max K, w3: max K, w2: max K}} for the MoE layers; per-expert classes are allowed."""
     out, bad = {}, []
     for li in range(t["num_hidden_layers"]):
         if not t["moe_layer_freq"][li]:
@@ -101,9 +101,13 @@ def expert_bits(st: SafeTensors, t: dict) -> tuple[dict, list[str]]:
         m = "%slayers.%d.block_sparse_moe.experts." % (P, li)
         out[li] = {}
         for w in ("w1", "w3", "w2"):
-            ks = {st.t["%s%d.%s.trellis" % (m, e, w)][2][-1] // 16 for e in range(t["num_local_experts"])}
-            if len(ks) != 1:
-                bad.append("layer %d %s: experts at bits %s" % (li, w, sorted(ks)))
+            ks = set()
+            for e in range(t["num_local_experts"]):
+                k = st.t["%s%d.%s.trellis" % (m, e, w)][2][-1] // 16
+                ks.add(k)
+                if k not in (1, 2, 3, 4):
+                    bad.append("layer %d expert %d %s: %d bits (mixed kernels support 1, 2, 3, or 4)" %
+                               (li, e, w, k))
             out[li][w] = max(ks)
     return out, bad
 
@@ -203,6 +207,7 @@ def main() -> int:
                 f.write("%s %d\n" % (k, cfg[k]))
         for k, v in special.items():
             f.write("special.%s %d\n" % (k, v))
+        # This is a readable summary; the TP loader derives each expert's class from its actual tensor metadata.
         for li, b in bits.items():
             f.write("exl3.%d %d,%d,%d\n" % (li, b["w1"], b["w3"], b["w2"]))
         vc = cfg.get("vision_config")

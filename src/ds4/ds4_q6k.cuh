@@ -121,10 +121,20 @@ inline void q6k_values(const uint8_t* b, float* y) {
         }
 }
 
-// value e of an Engram row in format fmt (1 Q6_K, 2 IQ4_NL; the row's blocks from its start)
+// one value of a ggml Q8_0 block (32 values, 34 bytes: d F16, then 32 int8), as ggml's dequantize_row_q8_0 computes
+// it: d * x[j], one product in F32 (the Engram tables ISTA-DASLab's GSQ-RCO GGUFs hold in Q8_0)
+constexpr int kQ8_0Bytes = 34;
+
+__device__ __forceinline__ float q8_0_value(const uint8_t* __restrict__ b, int j) {
+    const float d = __half2float(__ushort_as_half((unsigned short) (b[0] | (b[1] << 8))));
+    return __fmul_rn(d, (float) (int8_t) b[2 + j]);
+}
+
+// value e of an Engram row in format fmt (1 Q6_K, 2 IQ4_NL, 3 Q8_0; the row's blocks from its start)
 __device__ __forceinline__ float eg_block_value(const uint8_t* __restrict__ row, int e, int fmt) {
-    return fmt == 1 ? q6k_value(row + (size_t) (e / 256) * kQ6kBytes, e % 256)
-                    : iq4nl_value(row + (size_t) (e / 32) * kIq4nlBytes, e % 32);
+    return fmt == 1   ? q6k_value(row + (size_t) (e / 256) * kQ6kBytes, e % 256)
+           : fmt == 3 ? q8_0_value(row + (size_t) (e / 32) * kQ8_0Bytes, e % 32)
+                      : iq4nl_value(row + (size_t) (e / 32) * kIq4nlBytes, e % 32);
 }
 
 }  // namespace strata::ds4

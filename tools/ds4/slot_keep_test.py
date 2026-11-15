@@ -10,7 +10,7 @@ settings (`DS4_*` and the `MAYA_DS4_*` names, under the names the engine reads):
 sizes from hipMemGetInfo is not the one a config pins (`DS4_POOL_GB`), and there a QUIT can hang for its 300 s.  The
 slot settings this test sets win over the config's - the test decides what it measures.
 
-Six runs of the engine's `--serve` protocol (greedy, spec=0 so the state's position is the answer's, exactly):
+Seven runs of the engine's `--serve` protocol (greedy, spec=0 so the state's position is the answer's, exactly):
   no-keep  A, B, A's next turn (MAYA_DS4_SLOT_KEEP=0)  the reference: reused 0, and its answer to A builds the turn
                                                        every later run sends, so they all send the same prompt byte
                                                        for byte
@@ -21,6 +21,8 @@ Six runs of the engine's `--serve` protocol (greedy, spec=0 so the state's posit
   kept     A, B, then QUIT                             the folder keeps both conversations (2 .bin + .meta, under a
                                                        0.05 GB MAYA_DS4_SLOT_GB)
   restart  A's next turn alone, a new process          the same prefix reused, from the folder
+  pin      two prompts sharing their first N tokens    the second reports reused = N (the shared start kept as a
+           (pin=N), no slots                           checkpoint), so it reads only its own tail
   evict    A, B, C into a folder capped at A+B's bytes three conversations cannot fit: the least recently used (A) is
                                                        gone, B and C stay
 
@@ -144,8 +146,10 @@ class Engine:
         line, self.buffer = self.buffer.split(b"\n", 1)
         return line.decode("utf-8", "replace").strip()
 
-    def request(self, prompt: list[int], max_new: int, spec: int = 0, timeout: float = 3600.0) -> dict:
-        self.proc.stdin.write(f"GEN {max_new} spec={spec} {','.join(str(t) for t in prompt)}\n".encode())
+    def request(self, prompt: list[int], max_new: int, spec: int = 0, pin: int = 0,
+                timeout: float = 3600.0) -> dict:
+        keys = f" spec={spec}" + (f" pin={pin}" if pin else "")   # pin=N: the first N tokens are a shared start
+        self.proc.stdin.write(f"GEN {max_new}{keys} {','.join(str(t) for t in prompt)}\n".encode())
         self.proc.stdin.flush()
         out = {"tokens": [], "reused": None, "prompt": None, "finish": None, "s": 0.0}
         t0 = time.monotonic()
@@ -242,8 +246,9 @@ def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, 
         eng.start(timeout=1800.0)
         load_s = time.monotonic() - t0
         for name, make in steps:
-            prompt = make(answers)
-            answers[name] = eng.request(prompt, max_new)
+            made = make(answers)
+            prompt, pin = made if isinstance(made, tuple) else (made, 0)   # (prompt, pin=N) or just the prompt
+            answers[name] = eng.request(prompt, max_new, pin=pin)
             if "error" in answers[name]:
                 raise RuntimeError(f"{name}: {answers[name]['error']}")
             answers[name]["len"] = len(prompt)
@@ -405,6 +410,22 @@ def main() -> int:
         print(f"        {kept[0] if kept else '(no kept line)'}; reused {sr['reused']} in {sr['s']:.1f} s", flush=True)
         reuse_check("restart", sr["reused"], rk["A"]["tokens"])
         check(f"restart: the prompt's length agrees ({sr['prompt']} of {sr['len']})", sr["prompt"] == sr["len"])
+
+        print("pin: a shared start (pin=N) and two different tasks, one process, no slots", flush=True)
+        shared = text_tokens(tok, "Shared system prompt.", 4000)
+        task1, task2 = text_tokens(tok, "Task one.", 64), text_tokens(tok, "Another task.", 64)
+        pin = len(shared)                     # the system prompt alone: both tasks' prompts start with exactly it
+        rp, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, os.path.join(tmp, "pin"), False,
+                       [("one", lambda _: (shared + task1, pin)), ("two", lambda _: (shared + task2, pin))], max_new,
+                       settings=settings)
+        second = rp["two"]
+        print(f"        task one {len(shared) + len(task1)} tok in {rp['one']['s']:.1f} s; the other "
+              f"{len(shared) + len(task2)} tok in {second['s']:.1f} s, reused {second['reused']} of {pin}", flush=True)
+        check(f"pin: the first task reads its whole prompt (reused {rp['one']['reused']})", rp["one"]["reused"] == 0)
+        check(f"pin: the second task goes back to the shared start (reused {second['reused']} of {pin})",
+              second["reused"] == pin)
+        check(f"pin: the second task's prompt's length agrees ({second['prompt']} of {second['len']})",
+              second["prompt"] == second["len"] == len(shared) + len(task2))
 
         if sorted(kept_slots) != ["A", "B"]:
             raise RuntimeError("the kept folder does not hold A and B: the eviction check's cap needs their bytes")

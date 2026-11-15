@@ -37,6 +37,8 @@
 #include <cctype>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -1629,13 +1631,15 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // the pipelined window's default cut); the batched one crosses the parts in turn (the parts added)
     const bool df_pipe = dflash > 0 && dflash_pipelined(n);
     constexpr double kDfKept = 1.5;
-    // ... and there each layer also costs a fixed time a token beyond its reads (launches, the CPU lane's answer, the
-    // hops): Maya-L over 9 GPUs measured ~0.78 ms a layer on a 5060 Ti and ~0.59 on the 3090 (2.1x its bandwidth),
-    // ~0.4 ms of it fixed - priced by reads alone the 3090 took 10 layers and paced every draft (5.9 ms a kept draft;
-    // 8 layers: 4.9 ms, 57.1 / 58.9 -> 61.6 / 63.1 tok/s).  STRATA_GLM_SPLIT_LAYER_MS overrides it
-    const double layer_fixed = !df_pipe ? 0.0
-                               : getenv("STRATA_GLM_SPLIT_LAYER_MS") ? std::atof(getenv("STRATA_GLM_SPLIT_LAYER_MS"))
-                                                                     : 0.4;
+    // ... and there each layer also costs a fixed time a token beyond its reads (launches, the dense ships and the
+    // CPU lane's answer, the hops): the DFlash pipelined window measured ~0.4 ms a layer on the 3090 (Maya-L over
+    // 9 GPUs: ~0.78 on a 5060 Ti, ~0.59 on the 3090 - priced by reads alone the 3090 took 10 layers and paced
+    // every draft: 5.9 ms a kept draft; 8 layers: 4.9 ms, 57.1 / 58.9 -> 61.6 / 63.1 tok/s), and the split decode's
+    // dense navs ~0.35 (the same 3090: KDA/DSA/router GEMVs) while the parts run a token's layers.  STRATA_GLM_
+    // SPLIT_LAYER_MS overrides it
+    const double layer_fixed = getenv("STRATA_GLM_SPLIT_LAYER_MS") ? std::atof(getenv("STRATA_GLM_SPLIT_LAYER_MS"))
+                               : df_pipe                           ? 0.4
+                                                                   : 0.35;
     // each layer's routes per expert: the usage file (opt-in), else the pack's routing profile
     std::vector<std::vector<double>> cnt((size_t) L + 1);
     {
@@ -1666,8 +1670,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             while (ss >> c) cnt[(size_t) il].push_back(c);
         }
     }
-    // cover[l][s]: the share of layer l's routes its s most routed experts take
+    // cover[l][s]: the share of layer l's routes its s most routed experts take - and the mean of the layers' curves
+    // for the ones without counts (the NextN block, as fast_setup shapes its slots off the others)
     std::vector<std::vector<double>> cover((size_t) L + 1);
+    std::vector<double> mean_cover;
     for (int l = 0; l <= L; ++l) {
         std::vector<double> c = cnt[(size_t) l];
         const double tot = std::accumulate(c.begin(), c.end(), 0.0);
@@ -1675,6 +1681,17 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         std::sort(c.rbegin(), c.rend());
         cover[(size_t) l].assign(c.size() + 1, 0.0);
         for (size_t i = 0; i < c.size(); ++i) cover[(size_t) l][i + 1] = cover[(size_t) l][i] + c[i] / tot;
+    }
+    {
+        int nm = 0;
+        for (int l = 0; l <= L; ++l) {
+            const auto& cv = cover[(size_t) l];
+            if (cv.empty()) continue;
+            ++nm;
+            if (mean_cover.size() < cv.size()) mean_cover.resize(cv.size(), 0.0);
+            for (size_t s = 0; s < cv.size(); ++s) mean_cover[s] += cv[s];
+        }
+        for (double& x : mean_cover) x /= (double) std::max(1, nm);
     }
     // (an EXL3 pack: 1.4 - its experts are bigger, a card holds fewer of a layer's, and there the routes are flatter
     // than the curve at 3: EXL3-4.05bpw over 9 GPUs held 80% of a 5060 Ti layer's experts and hit VRAM on 89-96% of
@@ -1687,6 +1704,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         s = std::clamp<int64_t>(s, 0, g.n_expert);
         const auto& cv = cover[(size_t) l];
         if (!cv.empty()) return cv[(size_t) std::min<int64_t>(s, (int64_t) cv.size() - 1)];
+        if (!mean_cover.empty())
+            return mean_cover[(size_t) std::min<int64_t>(s, (int64_t) mean_cover.size() - 1)];
         return 1.0 - std::pow(1.0 - (double) s / g.n_expert, cover_b);
     };
     // the cards: free VRAM, memory bandwidth (the bus: 2 x memory clock x width); the host's RAM read speed
@@ -1731,9 +1750,76 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     constexpr int kSparesHere = 3;   // gf::kSpares: slots that hold no resident expert
     const int64_t keep = g.n_exp_used + kSparesHere + 2;
     const auto moe_layer = [&](int l) { return l >= g.dense_lead && blob[(size_t) l] > 0; };
+    // the shared-pool CPU lane (STRATA_GLM_CPU_SHARED=1): ONE pool serves every part's lane, so its work
+    // serializes across the parts and its rate is what one pool of the host reaches (the parts' pools read DRAM
+    // side by side otherwise - a lane per part, at the parts' share of the host).  STRATA_SPLIT_LANE_BPS pins it
+    const bool cpu_shared = [&] {
+        const char* v = getenv("STRATA_GLM_CPU_SHARED");
+        return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
+    }();
+    const double lane_bps = getenv("STRATA_SPLIT_LANE_BPS") ? std::atof(getenv("STRATA_SPLIT_LANE_BPS"))
+                            : cpu_shared ? std::max(1e9, 0.62 * (host_bps > 0 ? host_bps : 2e10))
+                                         : miss_bps;
+    // the misses MISS_SKIP leaves unrouted (STRATA_GLM_MISS_SKIP_W: a routed expert not in VRAM whose weight share
+    // of the route is below it, from STRATA_GLM_MISS_SKIP_FROM on): the pack's experts never see them, so the
+    // search prices their share off the late layers' misses - 0.57 of them at W 0.16, measured on this 2 x 3090
+    // (STRATA_SPLIT_SKIP_FRAC overrides)
+    const double miss_w = getenv("STRATA_GLM_MISS_SKIP_W") ? std::atof(getenv("STRATA_GLM_MISS_SKIP_W")) : 0.0;
+    const int miss_from = getenv("STRATA_GLM_MISS_SKIP_FROM") ? std::atoi(getenv("STRATA_GLM_MISS_SKIP_FROM"))
+                                                             : (miss_w > 0 ? 0 : INT_MAX);
+    const double skip_frac = getenv("STRATA_SPLIT_SKIP_FRAC") ? std::atof(getenv("STRATA_SPLIT_SKIP_FRAC")) : 0.57;
+    const auto skip_on = [&](int l) { return miss_w > 0 && skip_frac < 1.0 && l >= miss_from; };
+    // the parts' PCIe: an expert streamed off the host, timed here - the links differ so the parts price the
+    // misses apart (the x4 card's ~2.4 ms an expert vs the x16's ~0.27 put them on the cheaper road).  One blob
+    // warm, three rounds of two back-to-back copies, the best round read back - as the lane's calibration does
+    std::vector<double> pbs((size_t) n, 0.0);   // expert bytes/s per part (0: the parts price their misses off the lane)
+    if (const char* pv = getenv("STRATA_SPLIT_PCIE_BPS")) {
+        const double b = std::atof(pv);
+        if (b > 0) std::fill(pbs.begin(), pbs.end(), b);
+    } else {
+        const size_t pb = (size_t) std::max<double>(1.0, max_stride);
+        void* host = nullptr;
+        if (cudaMallocHost(&host, pb) == cudaSuccess && host != nullptr) {
+            std::memset(host, 1, pb);
+            for (int i = 0; i < n; ++i) {
+                cudaSetDevice(devs[(size_t) i]);
+                void* dev = nullptr;
+                if (cudaMalloc(&dev, pb) == cudaSuccess && dev != nullptr) {
+                    if (cudaMemcpy(dev, host, pb, cudaMemcpyHostToDevice) == cudaSuccess) {
+                        cudaEvent_t e0, e1;
+                        if (cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess) {
+                            double ms = 0;
+                            for (int r = 0; r < 3; ++r) {
+                                if (cudaEventRecord(e0) != cudaSuccess) break;
+                                for (int k = 0; k < 2; ++k)
+                                    cudaMemcpyAsync(dev, host, pb, cudaMemcpyHostToDevice);
+                                if (cudaEventRecord(e1) != cudaSuccess) break;
+                                if (cudaEventSynchronize(e1) == cudaSuccess) {
+                                    float f = 0;
+                                    if (cudaEventElapsedTime(&f, e0, e1) == cudaSuccess && f > 0)
+                                        ms = r == 0 || f < ms ? f : ms;
+                                }
+                            }
+                            if (ms > 0) pbs[(size_t) i] = 2.0 * (double) pb / (ms * 1e-3);
+                        }
+                        cudaEventDestroy(e0);
+                        cudaEventDestroy(e1);
+                    } else {
+                        cudaGetLastError();
+                    }
+                    cudaFree(dev);
+                } else {
+                    cudaGetLastError();
+                }
+            }
+            cudaSetDevice(cur);
+            cudaGetLastError();
+            cudaFreeHost(host);
+        }
+    }
     struct Eval {
-        double ms = 0, routes = 0, hits = 0;
-        int64_t per = 0;
+        double ms = 0, routes = 0, hits = 0, lanework = 0;
+        int64_t per = 0, nmin = 0, nmax = 0;
         bool ok = false;
     };
     // part i running layers [lb, le), memoised (a part's fill and time depend on its own range and card only)
@@ -1783,18 +1869,72 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             const int64_t k = (int64_t) std::ceil(need / ssum);
             ev.ok = k + keep <= ev.per && k * 100 <= 90 * ev.per;
         }
-        // a token on this part: each layer's reads over the card's bandwidth, its misses over the lane's share
-        const int64_t held = std::max<int64_t>(0, ev.per - kSparesHere);
+        // the slots, as fast_setup lays them out with the counts (STRATA_GLM_UNIFORM_SLOTS off): a floor a MoE layer,
+        // then each further slot goes to the layer whose next-most-routed expert serves the largest share of its
+        // lookups - the search priced the reads off a uniform pool, and read the split off to cardfuls of misses
+        // (the draft block keeps the uniform share whatever its routes: a miss there holds up every draft)
+        std::vector<int64_t> nsl((size_t) le, 0);
+        if (bsum > 0) {
+            const double draft_room = last && mtp ? (double) ev.per * stride[(size_t) L] : 0.0;
+            const int cap = g.n_expert + kSparesHere;
+            const int fl = std::min(cap, std::max((int) keep, std::min((int) ev.per, (int) keep + 16)));
+            int64_t used = last && mtp ? (int64_t) ev.per * (int64_t) stride[(size_t) L] : 0;
+            for (int l = lb; l < le; ++l)
+                if (moe_layer(l)) {
+                    nsl[(size_t) l] = fl;
+                    used += fl * (int64_t) stride[(size_t) l];
+                }
+            for (;;) {
+                int best = -1;
+                double bg = 0.0;
+                for (int l = lb; l < le; ++l) {
+                    if (!moe_layer(l) || l == L || nsl[(size_t) l] >= cap) continue;
+                    if ((double) used + stride[(size_t) l] > room - draft_room) continue;
+                    const int j = (int) (nsl[(size_t) l] - kSparesHere);
+                    const auto& cv = cover[(size_t) l].empty() ? mean_cover : cover[(size_t) l];
+                    const double v = j + 1 < (int) cv.size() ? cv[(size_t) (j + 1)] - cv[(size_t) j] : 0.0;
+                    if (v > bg) { bg = v; best = l; }
+                }
+                if (best < 0) break;
+                ++nsl[(size_t) best];
+                used += (int64_t) stride[(size_t) best];
+            }
+            if ((double) used > room) ev.ok = false;   // the floors do not fit: the pool cannot start
+            ev.nmin = INT64_MAX;
+            for (int l = lb; l < le; ++l) {
+                if (!moe_layer(l) || l == L) continue;
+                ev.nmin = std::min(ev.nmin, nsl[(size_t) l]);
+                ev.nmax = std::max(ev.nmax, nsl[(size_t) l]);
+            }
+            if (ev.nmin == INT64_MAX) { ev.nmin = 0; ev.nmax = 0; }
+        }
+        // a token on this part: each layer's reads over the card's bandwidth, its misses over the cheaper road - the
+        // lane plan streams part of a layer's misses off the host and computes the rest, both roads in flight, so
+        // an expert prices at its bytes over the two links' rates added (the share that equalizes the arms); the
+        // x4 link's ~3 ms and the x16's ~0.3 an expert price the parts apart (the shared pool's lane work
+        // serializes, capped in price()); a late layer's misses whose weight share MISS_SKIP leaves out price off
         const auto layer_ms = [&](int l, double dense_b) {
-            double gpu = dense_b, cpu = 0;
-            if (l == L || moe_layer(l)) {
-                const double h = g.n_exp_used * held_share(l, held);
+            double gpu = dense_b, miss = 0;
+            if (l <= L && (l == L || moe_layer(l))) {
+                const double h = g.n_exp_used * held_share(l, nsl[(size_t) l] - kSparesHere);
                 gpu += h * blob[(size_t) l];
-                cpu = (g.n_exp_used - h) * blob[(size_t) l];
+                double f = std::max(0.0, (double) g.n_exp_used - h) * blob[(size_t) l];
+                if (skip_on(l)) f *= 1.0 - skip_frac;
+                if (f > 0) {
+                    if (df_pipe) {
+                        miss = 1e3 * f / miss_bps;   // the window's one pool serves every part's misses
+                    } else if (pbs[(size_t) i] > 0) {
+                        miss = 1e3 * f / (pbs[(size_t) i] + lane_bps);
+                        ev.lanework += f * lane_bps / (pbs[(size_t) i] + lane_bps);
+                    } else {
+                        miss = 1e3 * f / lane_bps;
+                        ev.lanework += f;
+                    }
+                }
                 ev.hits += h;
                 ev.routes += g.n_exp_used;
             }
-            return 1e3 * (gpu / c.bw + cpu / miss_bps) + layer_fixed;
+            return 1e3 * (gpu / c.bw) + miss + layer_fixed;
         };
         for (int l = lb; l < le; ++l) ev.ms += layer_ms(l, dense[(size_t) l]);
         if (last) {
@@ -1807,17 +1947,21 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // a placement: {objective, tie-break, startable}; parts' times in `ms`
     const auto price = [&](const std::vector<int>& b, std::vector<Eval>& ev, double& obj, double& tie) -> bool {
         ev.clear();
-        double sum = 0, slow = 0;
+        double sum = 0, slow = 0, lanework = 0;
         bool ok = true;
         for (int i = 0; i < n; ++i) {
             const int lb = i == 0 ? 0 : b[(size_t) i - 1], le = i + 1 < n ? b[(size_t) i] : L;
             ev.push_back(stage(i, lb, le));
             sum += ev.back().ms;
             slow = std::max(slow, ev.back().ms);
+            lanework += ev.back().lanework;
             ok = ok && ev.back().ok;
         }
-        obj = pipelined ? slow : df_pipe ? (sum + kDfKept * slow) / (1.0 + kDfKept) : sum;
-        tie = pipelined ? sum : slow;
+        // the shared pool's lane: its work runs once no matter how the misses split, so a part it serves for can
+        // pace the token even when the per-part times are ahead of it
+        const double lane_cap = cpu_shared ? 1e3 * lanework / lane_bps : 0.0;
+        obj = pipelined ? std::max(slow, lane_cap) : df_pipe ? (sum + kDfKept * slow) / (1.0 + kDfKept) : sum;
+        tie = pipelined ? std::max(sum, lane_cap) : slow;
         return ok;
     };
     static const bool split_log = getenv("STRATA_GLM_SPLIT_LOG") != nullptr;
@@ -1899,9 +2043,16 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     for (const auto& c : cards)
         std::fprintf(stderr, "glm split auto: CUDA%d (%s) memory %.0f GB/s, %.2f GB free\n", c.dev, c.name.c_str(),
                      c.bw / 1e9, c.free / 1073741824.0);
-    std::fprintf(stderr, "glm split auto: the host reads RAM at %.0f GB/s (a part's CPU lane: %.0f); the routes from %s; "
-                         "%s\n", host_bps / 1e9, miss_bps / 1e9,
+    for (int i = 0; i < n; ++i)
+        if (pbs[(size_t) i] > 0)
+            std::fprintf(stderr, "glm split auto: CUDA%d streams an expert in %.2f ms\n", cards[(size_t) i].dev,
+                         max_stride > 0 ? 1e3 * max_stride / pbs[(size_t) i] : 0.0);
+    std::fprintf(stderr, "glm split auto: the host reads RAM at %.0f GB/s (the CPU lane serves an expert in %.2f ms%s); "
+                         "the routes from %s%s; %s\n", host_bps / 1e9,
+                 max_stride > 0 ? 1e3 * max_stride / lane_bps : 0.0,
+                 cpu_shared ? ", one pool for every part" : ", a pool per part",
                  cover[3].empty() ? "the default coverage curve (no usage counts)" : "the usage counts",
+                 miss_w > 0 ? (skip_frac < 1.0 ? ", the late layers' misses price partly off (skip)" : "") : "",
                  pipelined ? "the pipelined decode: a token costs the slower part"
                  : df_pipe ? "the DFlash pipelined window: a round of a kept drafts costs the parts added + a x the slowest"
                            : "a token costs the parts added");
@@ -1920,8 +2071,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         char buf[160];
         std::snprintf(buf, sizeof buf, "%s[%d, %d) on CUDA%d", i ? ", " : "", lb, le, cards[(size_t) i].dev);
         where += buf;
-        std::snprintf(buf, sizeof buf, "%sCUDA%d %.1f ms, %lld slots a layer", i ? " | " : "", cards[(size_t) i].dev,
-                      ev[(size_t) i].ms, (long long) ev[(size_t) i].per);
+        std::snprintf(buf, sizeof buf, "%sCUDA%d %.1f ms, %lld..%lld slots a layer", i ? " | " : "", cards[(size_t) i].dev,
+                      ev[(size_t) i].ms, (long long) ev[(size_t) i].nmin, (long long) ev[(size_t) i].nmax);
         parts += buf;
         hits += ev[(size_t) i].hits;
         routes += ev[(size_t) i].routes;

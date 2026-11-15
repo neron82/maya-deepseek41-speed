@@ -959,6 +959,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (dflash_on_ && !win_reserve(err)) return false;
     // the one-GPU MTP decode (glm_mtp.cu; load_pack loaded the NextN block for it): the same window, the NextN cache
     // fill's rows, the draft head and the chain's token_embd - before the pool too; without them, token by token
+    if (getenv("STRATA_GLM_MTP_TRACE") != nullptr)
+        std::fprintf(stderr, "trace mtp gate: mtp_il_ %d, split_next_ %p, l0_ %d, dflash_on_ %d, wanted %d, n_parts_ %d\n",
+                     mtp_il_, (void*) (split_next_ != nullptr ? this : nullptr), l0_, (int) dflash_on_,
+                     (int) mtp_decode_wanted(dev_, n_parts_), n_parts_);
     if (mtp_il_ >= 0 && split_next_ == nullptr && l0_ == 0 && !dflash_on_ && mtp_decode_wanted(dev_, n_parts_)) {
         std::string werr;
         if (win_reserve(werr) && mtp_cache_setup(werr)) {

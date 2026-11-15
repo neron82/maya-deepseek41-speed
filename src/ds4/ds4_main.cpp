@@ -16,6 +16,9 @@
 // does continue a kept conversation reads only its new tokens.  A kept conversation holds its pictures' marks too (a
 // span's start, its pixels' fingerprint, its length): it comes back only for a prompt whose pictures are the same at
 // the same places.
+// `pin=N` on a GEN marks the first N prompt tokens as a start other requests share (a system prompt and its tools): the
+// read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
+// reading it again (also without slots).
 #include "ds4_model.hpp"
 #include "ds4_watchdog.hpp"
 #include "strata/platform/env_alias.hpp"
@@ -347,6 +350,9 @@ struct Req {
     unsigned long long seed = 0;
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
+    long long pin = 0;      // pin=N: the first N prompt tokens are a start other requests share (a system prompt and its
+                            // tools): the state at N is kept as a checkpoint, so another agent behind the same start
+                            // goes back to it instead of reading it again
     float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
     int lookup = -1;        // suffix_draft=0|1: this request's prompt lookup off / on (-1: as the engine was started)
     // the penalties (penalty_last_n / _repeat / _freq / _present, llama.cpp's): over the last pen_n tokens of the state
@@ -470,6 +476,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
+        else if (k == "pin") r.pin = std::atoll(v.c_str());
         else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
         else if (k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);   // (the server's strata_tune names)
         else if (k == "suffix_draft") r.lookup = std::atoi(v.c_str()) != 0;
@@ -656,7 +663,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) m.max_context())
             return false;
         toks.resize(nt);
-        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 3)
+        // (its checkpoints: the end of a prompt, the one before it, the anchor and the shared start's prefix)
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 4)
             return false;
         cks.resize(nc);
         if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t))) || !f.read((char*) &np, 8)) return false;
@@ -828,9 +836,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // to - back in the model: the tokens it covers (0: none).  A conversation the prompt continues whole comes back
     // whole (`whole`); one it leaves part way - a retried prompt, a history the client renders again without the
     // earlier reasoning - comes back at its latest checkpoint the prompt still agrees with (the end of a prompt, the
-    // position before it, the anchor where its run of continued prompts began).  A conversation whose pictures (their
-    // places, their pixels) the prompt agrees with up to that point comes back too: the KV of a picture's span needs
-    // the same picture (the tokens alone are all the image token, whatever the image).
+    // position before it, the anchor where its run of continued prompts began, the shared start's pin).  A
+    // conversation whose pictures (their places, their pixels) the prompt agrees with up to that point comes back
+    // too: the KV of a picture's span needs the same picture (the tokens alone are all the image token, whatever the
+    // image).
     const auto slot_take = [&](const std::vector<int>& prompt, const std::vector<Pic>& want, size_t floor,
                                bool& whole) -> size_t {
         whole = false;
@@ -1200,6 +1209,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         });
         // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
         static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
+        // (pin=N: the read stops at N for a checkpoint of the shared start; only when this read crosses N, and N leaves
+        //  the prompt's last token to the usual end)
+        const size_t pin_at = (r.pin >= 256 && (size_t) r.pin + 1 < total) ? (size_t) r.pin : 0;
         // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
         // feeds) and goes back to the state before this prompt - kept here first, in checkpoint 1, which the prompt's
         // own end overwrites as before - so the next request still shares the conversation up to it
@@ -1211,7 +1223,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 stopped = true;
                 break;
             }
-            const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            if (pin_at > done && pin_at < done + n) n = pin_at - done;
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = done + n == total;
             if (fin && last_window) {
@@ -1222,6 +1235,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
                          : m.feed(r.ids.data() + done, (int) n, 0, err);
             done += n;
+            if (ok && pin_at != 0 && done == pin_at) m.checkpoint(3);
             beat();
             if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;

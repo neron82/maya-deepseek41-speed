@@ -2011,6 +2011,7 @@ int main(int argc, char** argv) {
         std::string out;
         t0 = now();
         int pos = n, done = 0;
+        const auto s0 = m.stats();
         for (int g = 0; g < gen; ++g) {
             std::printf("%d%s", next, g + 1 < gen ? " " : "\n");
             std::fflush(stdout);
@@ -2035,8 +2036,9 @@ int main(int argc, char** argv) {
         if (::mm3::env("MM3_TIMING") && done > 0) {
             const auto& s2 = m.stats();
             std::fprintf(stderr, "  a token: %.1f ms - routing waits %.1f ms, CPU lane %.1f ms, promotions' copies %.1f ms "
-                         "(%ld promoted)\n", 1e3 * s2.t_token / done, 1e3 * s2.t_sync / done, 1e3 * s2.t_lane / done,
-                         1e3 * s2.t_promo / done, s2.promoted);
+                         "(%ld promoted)\n", 1e3 * (s2.t_token - s0.t_token) / done,
+                         1e3 * (s2.t_sync - s0.t_sync) / done, 1e3 * (s2.t_lane - s0.t_lane) / done,
+                         1e3 * (s2.t_promo - s0.t_promo) / done, s2.promoted - s0.promoted);
         }
     }
     if (!profile_out.empty()) {

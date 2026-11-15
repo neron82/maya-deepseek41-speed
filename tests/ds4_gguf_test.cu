@@ -2166,6 +2166,7 @@ void test_lanes(cudaStream_t s) {   // MXFP4 and every low-bit pair
 }
 
 // ---------------------------------------------------------------- Engram rows in Q6_K
+
 __global__ void q6k_rows_kernel(const uint8_t* rows, int hd, float* out) {   // (engram_dequant's Q6_K branch)
     const int r = blockIdx.x;
     for (int e = threadIdx.x; e < hd; e += blockDim.x)
@@ -2220,6 +2221,36 @@ void test_engram_iq4nl(cudaStream_t s) {
     if (!same) ++g_fail;
     std::printf("%-52s %s\n", "Engram IQ4_NL rows = ggml's, bit for bit", same ? "ok" : "FAIL");
     cudaFree(d_rows), cudaFree(d_out);
+}
+// ---------------------------------------------------------------- Engram rows in Q8_0 (the GSQ-RCO packs' tables)
+void test_engram_q8_0(cudaStream_t s) {
+    const int T = 3, cols = 8, hd = 256;   // a token's rows back to back: cols Q8_0 rows, no scale area after them
+    const int row = hd / 32 * strata::ds4::kQ8_0Bytes, per = cols * row;
+    std::vector<uint8_t> packed((size_t) T * per, 0);
+    for (size_t b = 0; b < (size_t) T * cols * (hd / 32); ++b) {   // d: a small normal F16, then 32 int8 codes
+        const __half h = __float2half(0.0005f + 0.002f * std::fabs(frand()));
+        std::memcpy(&packed[b * 34], &h, 2);
+        for (int j = 0; j < 32; ++j) packed[b * 34 + 2 + j] = (uint8_t) (rng() & 0xff);
+    }
+    std::vector<float> want((size_t) T * cols * hd);
+    for (int r = 0; r < T * cols; ++r)
+        ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float(packed.data() + (size_t) r * row, want.data() + (size_t) r * hd, hd);
+    uint8_t* d_src = dev(packed);
+    float* d_out = dev(std::vector<float>(want.size()));
+    dk::engram_dequant_tok(d_src, (size_t) per, cols, T, hd, d_out, s, 3);
+    CU(cudaStreamSynchronize(s));
+    std::vector<float> got = host(d_out, want.size());
+    bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+    if (!same) ++g_fail;
+    std::printf("%-52s %s\n", "Engram Q8_0 rows (token layout) = ggml's", same ? "ok" : "FAIL");
+    // the decode path: all the window's rows together, the format's own row stride
+    dk::engram_dequant(d_src, nullptr, T * cols, hd, d_out, s, 3);
+    CU(cudaStreamSynchronize(s));
+    got = host(d_out, want.size());
+    same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+    if (!same) ++g_fail;
+    std::printf("%-52s %s\n", "Engram Q8_0 rows (window) = ggml's, bit for bit", same ? "ok" : "FAIL");
+    cudaFree(d_src), cudaFree(d_out);
 }
 void test_q6k_host() {
     const int nb = 512;
@@ -2438,6 +2469,7 @@ int main(int argc, char** argv) {
     test_mv(s);
     test_engram_q6k(s);
     test_engram_iq4nl(s);
+    test_engram_q8_0(s);
     test_q5k_host();
     test_q6k_host();
     test_experts(512, 256, s);

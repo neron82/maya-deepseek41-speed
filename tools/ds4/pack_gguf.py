@@ -334,6 +334,15 @@ def short(g: Gguf):
     return None if have >= need else "%s: %d of %d bytes" % (g.path.name, have, need)
 
 
+def is_engram_shard(g: Gguf) -> bool:
+    """A file of the Engram tables alone: a GGUF whose architecture says so, or (ISTA-DASLab's Dense-Engram companions)
+    one that carries split metadata only and every tensor of it an engram table - never a model shard."""
+    arch = str(g.kv.get("general.architecture") or "")
+    if arch:
+        return arch == "engram" or arch.endswith("-engram")
+    return bool(g.tensors) and all(re.match(r"(blk\.\d+\.engram_|engram_)", t[0]) for t in g.tensors)
+
+
 def engram_set(model: pathlib.Path, explicit: str | None):
     """The Engram tables' GGUF set for a quant that leaves them out: (its folder, its files read), or (None, []).
     explicit (--engram): that folder, whole; else the first whole one of ENGRAM_SETS beside the quant or in its
@@ -409,7 +418,8 @@ def main() -> int:
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
     ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
     ap.add_argument("--engram", help="the folder of the Engram tables' GGUF set, for a quant that leaves them out "
-                                     "(default: <model>/../Engram, when it is whole)")
+                                     "(default: <model>/../Engram, when it is whole; the model's own Dense-Engram "
+                                     "companion shards are taken where they sit beside its shards)")
     ap.add_argument("--shards", nargs="+", help="the GGUF's files in --model (default: every .gguf there - one "
                                                 "model's; the setup names them: a folder may hold an earlier layout)")
     ap.add_argument("--without", nargs="+", default=[],
@@ -426,8 +436,22 @@ def main() -> int:
                          "%s: not there" % next(p for p in shards if not p.is_file()))
     gs = [Gguf(p) for p in shards]
     # (a folder of shards beside a separate Engram GGUF: its tables, read below, not a shard)
-    side = [g for g in gs if g.kv.get("general.architecture") == "deepseek41-engram"]
+    side = [g for g in gs if is_engram_shard(g)]
     gs = [g for g in gs if g not in side]
+    if not side:   # (--shards named only the trunk: a Dense-Engram companion in the same folder still counts)
+        named = {g.path.name for g in gs}
+        for p in sorted(model.glob("*.gguf")):
+            if p.name in named:
+                continue
+            try:
+                g = Gguf(p)
+            except (OSError, SystemExit, struct.error):
+                continue
+            if is_engram_shard(g):
+                why = short(g)
+                if why:
+                    raise SystemExit("%s: not whole (%s)" % (p, why))
+                side.append(g)
     kv = next((g.kv for g in gs if "general.architecture" in g.kv), None)
     if kv is None or kv["general.architecture"] not in ("deepseek41",):
         raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, kv and kv.get("general.architecture")))

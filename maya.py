@@ -5275,8 +5275,8 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     # ~19 -> 32 (prose), prompts 35-70 -> ~100 tok/s
     n = len(pc["gpus"])
     if "--tp" not in args[:-1] and not gguf:   # (a GGUF pack: the layer split - maya-mm3's tensor parallel is EXL3's)
-        for tp in (4, 2):
-            if n > tp and ((n - 1) % tp == 0 or n % tp == 0):
+        for tp in (4, 2, 1):
+            if n >= tp and ((n - 1) % tp == 0 or n % tp == 0):
                 args += ["--tp", str(tp)]
                 break
     # DSpark (the draft in the pack: tools/mm3/pack.py indexes dspark/): drafts verified by the model, the same tokens

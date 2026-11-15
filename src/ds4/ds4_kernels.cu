@@ -2485,6 +2485,11 @@ __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const ui
     pdl_wait();
     pdl_trigger();
     const int r = blockIdx.x;
+    if (fmt == 3) {   // (whole ggml Q8_0 rows: 34 bytes a 32 values, their d inside)
+        for (int e = threadIdx.x; e < hd; e += blockDim.x)
+            out[(size_t) r * hd + e] = eg_block_value(rows + (size_t) r * (hd / 32 * kQ8_0Bytes), e, 3);
+        return;
+    }
     if (fmt != 0) {   // (ggml Q6_K / IQ4_NL blocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = eg_block_value(rows + (size_t) r * hd, e, fmt);
@@ -2613,8 +2618,9 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
-            plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
-            cpu |= vram[pick[r]] == 0ull;
+            unsigned long long a = vram[pick[r]];
+            plan_ptr[(size_t) t * kPicks + r] = a;
+            cpu |= a == 0ull;
             if (req != nullptr) {
                 req->ids[t][r] = pick[r];
                 req->w[t][r] = wv;
@@ -2726,8 +2732,9 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
                 const float wv = sc[pick[r]] / (s + 1e-20f) * a.route_scale;
                 a.idx[(size_t) t * kPicks + r] = pick[r];
                 a.w[(size_t) t * kPicks + r] = wv;
-                a.plan_ptr[(size_t) t * kPicks + r] = a.vram[pick[r]];
-                cpu |= a.vram[pick[r]] == 0ull;
+                unsigned long long addr = a.vram[pick[r]];
+                a.plan_ptr[(size_t) t * kPicks + r] = addr;
+                cpu |= addr == 0ull;
                 if (a.req != nullptr) {
                     a.req->ids[t][r] = pick[r];
                     a.req->w[t][r] = wv;
@@ -3242,6 +3249,12 @@ __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_
     pdl_wait();
     pdl_trigger();
     const int r = blockIdx.x, t = r / cols, c = r - t * cols;
+    if (fmt == 3) {   // (whole ggml Q8_0 rows: no scale area after them)
+        const uint8_t* q8row = src + (size_t) t * per + (size_t) c * (hd / 32 * kQ8_0Bytes);
+        for (int e = threadIdx.x; e < hd; e += blockDim.x)
+            out[(size_t) r * hd + e] = eg_block_value(q8row, e, 3);
+        return;
+    }
     const uint8_t* rows = src + (size_t) t * per + (size_t) c * hd;
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
     if (fmt != 0) {   // (ggml Q6_K / IQ4_NL blocks at the row's start)
